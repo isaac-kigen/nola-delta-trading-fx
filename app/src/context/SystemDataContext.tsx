@@ -8,7 +8,7 @@ import {
   useMemo,
   useState,
 } from 'react';
-import { buildMockSystemSnapshot } from '@/lib/system-mock-data';
+import { buildEmptySystemSnapshot } from '@/lib/system-defaults';
 import type {
   SystemActionName,
   SystemActionResult,
@@ -36,13 +36,14 @@ async function fetchSnapshot(): Promise<SystemSnapshotResponse> {
   });
   const data = (await response.json()) as SystemSnapshotResponse;
   if (!response.ok) {
-    throw new Error(`Snapshot fetch failed with status ${response.status}`);
+    const message = typeof data.warning === 'string' ? data.warning : `Snapshot fetch failed with status ${response.status}`;
+    throw new Error(message);
   }
   return data;
 }
 
 export function SystemDataProvider({ children }: { children: React.ReactNode }) {
-  const [snapshot, setSnapshot] = useState<SystemSnapshot>(() => buildMockSystemSnapshot());
+  const [snapshot, setSnapshot] = useState<SystemSnapshot>(() => buildEmptySystemSnapshot(null));
   const [isLive, setIsLive] = useState(false);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);

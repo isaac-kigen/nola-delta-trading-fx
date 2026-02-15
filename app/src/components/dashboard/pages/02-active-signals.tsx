@@ -47,7 +47,7 @@ export default function ActiveSignalsPage() {
             <Badge
               className={`border ${isLive ? 'bg-green-500/20 text-green-400 border-green-500/50' : 'bg-yellow-500/20 text-yellow-400 border-yellow-500/50'}`}
             >
-              {isLive ? 'LIVE' : 'MOCK'}
+              {isLive ? 'LIVE' : 'OFFLINE'}
             </Badge>
           </CardTitle>
           <CardDescription>
