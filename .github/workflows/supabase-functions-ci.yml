@@ -1,0 +1,39 @@
+name: Supabase Functions CI
+
+on:
+  pull_request:
+    paths:
+      - "supabase/**"
+      - ".github/workflows/supabase-functions-ci.yml"
+  push:
+    paths:
+      - "supabase/**"
+      - ".github/workflows/supabase-functions-ci.yml"
+
+jobs:
+  deno-check-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Type check functions
+        run: |
+          set -euo pipefail
+          find supabase/functions -type f -name '*.ts' -print0 | xargs -0 -n1 deno check
+
+      - name: Run shared unit tests
+        run: |
+          set -euo pipefail
+          deno test supabase/functions/_shared/auth_test.ts
+
+      - name: Lint smoke script syntax
+        run: |
+          set -euo pipefail
+          bash -n supabase/tests/smoke_pipeline.sh

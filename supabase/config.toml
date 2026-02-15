@@ -1,0 +1,23 @@
+[functions.sync-latest-candle]
+verify_jwt = false
+
+[functions.check-trading-opportunity]
+verify_jwt = false
+
+[functions.backfill-candle-history]
+verify_jwt = false
+
+[functions.validate-strategy]
+verify_jwt = false
+
+[functions.execute-broker-orders]
+verify_jwt = false
+
+[functions.sync-broker-positions]
+verify_jwt = false
+
+[functions.ctrader-callback]
+verify_jwt = false
+
+[functions.ctrader-oauth-callback]
+verify_jwt = false

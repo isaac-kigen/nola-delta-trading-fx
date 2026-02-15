@@ -1,0 +1,10 @@
+export { default as OverviewPage } from './01-overview';
+export { default as ActiveSignalsPage } from './02-active-signals';
+export { default as TradingHistoryPage } from './03-trading-history';
+export { default as StrategyConfigPage } from './04-strategy-config';
+export { default as BacktestResultsPage } from './05-backtest-results';
+export { default as MarketDataPage } from './06-market-data';
+export { default as RiskManagementPage } from './07-risk-management';
+export { default as SymbolManagementPage } from './08-symbol-management';
+export { default as NotificationsPage } from './09-notifications';
+export { default as AnalyticsPage } from './10-analytics';
