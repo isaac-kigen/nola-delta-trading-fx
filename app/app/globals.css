@@ -1,0 +1,103 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 214 35% 97%;
+    --foreground: 224 71% 4%;
+    --card: 0 0% 100%;
+    --card-foreground: 224 71% 4%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 224 71% 4%;
+    --primary: 160 84% 39%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 214 28% 92%;
+    --secondary-foreground: 224 71% 4%;
+    --muted: 214 32% 93%;
+    --muted-foreground: 215 17% 40%;
+    --accent: 214 32% 93%;
+    --accent-foreground: 224 71% 4%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 215 25% 88%;
+    --input: 215 25% 88%;
+    --ring: 160 84% 39%;
+    --chart-1: 160 84% 39%;
+    --chart-2: 199 89% 48%;
+    --chart-3: 221 83% 53%;
+    --chart-4: 38 92% 50%;
+    --chart-5: 343 83% 59%;
+    --radius: 0.9rem;
+  }
+  .dark {
+    --background: 222 47% 7%;
+    --foreground: 0 0% 98%;
+    --card: 223 38% 11%;
+    --card-foreground: 0 0% 98%;
+    --popover: 223 38% 11%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 160 84% 39%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 223 31% 17%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 223 31% 17%;
+    --muted-foreground: 218 11% 70%;
+    --accent: 223 31% 17%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 223 22% 21%;
+    --input: 223 22% 21%;
+    --ring: 160 84% 39%;
+    --chart-1: 160 84% 39%;
+    --chart-2: 199 89% 48%;
+    --chart-3: 221 83% 53%;
+    --chart-4: 38 92% 50%;
+    --chart-5: 343 83% 59%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    background-image: radial-gradient(circle at top left, hsl(var(--primary) / 0.08), transparent 28%),
+      radial-gradient(circle at 80% 0%, hsl(var(--chart-2) / 0.08), transparent 22%);
+  }
+}
+
+@layer components {
+  .glass-panel {
+    @apply border border-white/10 bg-white/65 shadow-sm dark:bg-black/25;
+    animation: rise-in 0.5s ease-out both;
+  }
+  .ticker-shell {
+    background: linear-gradient(90deg, hsl(var(--primary) / 0.08), transparent 20%, transparent 80%, hsl(var(--chart-2) / 0.08));
+  }
+  .ticker-track {
+    animation: ticker-move 22s linear infinite;
+  }
+}
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes ticker-move {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
