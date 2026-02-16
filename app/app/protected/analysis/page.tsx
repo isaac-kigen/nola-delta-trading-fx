@@ -165,62 +165,94 @@ export default async function AnalysisOverviewPage() {
           <CardDescription>Click an asset to open detailed analysis state</CardDescription>
         </CardHeader>
         <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Asset</TableHead>
-                <TableHead>Analysis</TableHead>
-                <TableHead>Freshness</TableHead>
-                <TableHead>Watch Mode</TableHead>
-                <TableHead className="text-right">Last Signal</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rows.map((row) => (
-                <TableRow key={row.symbol}>
-                  <TableCell className="font-medium">
-                    <div className="flex items-center gap-2">
-                      <Link
-                        href={`/protected/analysis/${encodeURIComponent(row.symbol)}`}
-                        className="text-primary hover:underline"
-                      >
-                        {row.symbol}
-                      </Link>
-                      {!row.enabled && <Badge variant="secondary" className="rounded-full">disabled</Badge>}
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <div>
-                      <p className="text-sm font-medium">{row.analysisLabel}</p>
-                      <p className="text-xs text-muted-foreground">{row.analysisReason}</p>
-                    </div>
-                  </TableCell>
-                  <TableCell className="text-sm text-muted-foreground">{relativeTime(row.freshnessRef)}</TableCell>
-                  <TableCell>
+          <div className="space-y-2 md:hidden">
+            {rows.map((row) => (
+              <Link
+                key={row.symbol}
+                href={`/protected/analysis/${encodeURIComponent(row.symbol)}`}
+                className="block rounded-xl border border-border/70 p-3"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <p className="font-medium">{row.symbol}</p>
+                  <div className="flex items-center gap-2">
+                    {!row.enabled && <Badge variant="secondary" className="rounded-full">disabled</Badge>}
                     <Badge variant={row.watchActive ? "default" : "secondary"} className="rounded-full">
-                      {row.watchActive ? "active" : "inactive"}
+                      {row.watchActive ? "watch on" : "watch off"}
                     </Badge>
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <span className="text-sm">{row.lastSignalState}</span>
-                    <span className="ml-2 text-xs text-muted-foreground">
-                      ({row.lastSetupScore.toFixed(1)})
-                    </span>
-                  </TableCell>
-                </TableRow>
-              ))}
-              {rows.length === 0 && (
+                  </div>
+                </div>
+                <p className="mt-2 text-sm font-medium">{row.analysisLabel}</p>
+                <p className="text-xs text-muted-foreground">{row.analysisReason}</p>
+                <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
+                  <span>{relativeTime(row.freshnessRef)}</span>
+                  <span>{row.lastSignalState} ({row.lastSetupScore.toFixed(1)})</span>
+                </div>
+              </Link>
+            ))}
+            {rows.length === 0 && (
+              <div className="rounded-xl border border-border/70 p-3 text-center text-sm text-muted-foreground">
+                No assets configured in `strategy_symbol_config`.
+              </div>
+            )}
+          </div>
+
+          <div className="hidden md:block">
+            <Table>
+              <TableHeader>
                 <TableRow>
-                  <TableCell colSpan={5} className="text-center text-sm text-muted-foreground">
-                    No assets configured in `strategy_symbol_config`.
-                  </TableCell>
+                  <TableHead>Asset</TableHead>
+                  <TableHead>Analysis</TableHead>
+                  <TableHead>Freshness</TableHead>
+                  <TableHead>Watch Mode</TableHead>
+                  <TableHead className="text-right">Last Signal</TableHead>
                 </TableRow>
-              )}
-            </TableBody>
-          </Table>
+              </TableHeader>
+              <TableBody>
+                {rows.map((row) => (
+                  <TableRow key={row.symbol}>
+                    <TableCell className="font-medium">
+                      <div className="flex items-center gap-2">
+                        <Link
+                          href={`/protected/analysis/${encodeURIComponent(row.symbol)}`}
+                          className="text-primary hover:underline"
+                        >
+                          {row.symbol}
+                        </Link>
+                        {!row.enabled && <Badge variant="secondary" className="rounded-full">disabled</Badge>}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <div>
+                        <p className="text-sm font-medium">{row.analysisLabel}</p>
+                        <p className="text-xs text-muted-foreground">{row.analysisReason}</p>
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-sm text-muted-foreground">{relativeTime(row.freshnessRef)}</TableCell>
+                    <TableCell>
+                      <Badge variant={row.watchActive ? "default" : "secondary"} className="rounded-full">
+                        {row.watchActive ? "active" : "inactive"}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <span className="text-sm">{row.lastSignalState}</span>
+                      <span className="ml-2 text-xs text-muted-foreground">
+                        ({row.lastSetupScore.toFixed(1)})
+                      </span>
+                    </TableCell>
+                  </TableRow>
+                ))}
+                {rows.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={5} className="text-center text-sm text-muted-foreground">
+                      No assets configured in `strategy_symbol_config`.
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </div>
         </CardContent>
       </Card>
     </>
   );
 }
-

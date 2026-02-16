@@ -155,31 +155,51 @@ export default async function AssetAnalysisDetailPage({
             <CardDescription>Latest 20 rows from `trading_opportunity_checks`</CardDescription>
           </CardHeader>
           <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>When</TableHead>
-                  <TableHead>State</TableHead>
-                  <TableHead>Direction</TableHead>
-                  <TableHead className="text-right">Score</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {checks.map((row) => (
-                  <TableRow key={row.id}>
-                    <TableCell className="text-xs text-muted-foreground">{new Date(row.checked_at).toLocaleString()}</TableCell>
-                    <TableCell>{row.signal_state}</TableCell>
-                    <TableCell>{row.direction ?? "none"}</TableCell>
-                    <TableCell className="text-right">{asNumber(row.setup_score, 0).toFixed(1)}</TableCell>
-                  </TableRow>
-                ))}
-                {checks.length === 0 && (
+            <div className="space-y-2 md:hidden">
+              {checks.map((row) => (
+                <div key={row.id} className="rounded-xl border border-border/70 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs text-muted-foreground">{new Date(row.checked_at).toLocaleString()}</p>
+                    <p className="text-sm font-medium">{asNumber(row.setup_score, 0).toFixed(1)}</p>
+                  </div>
+                  <div className="mt-1 flex items-center justify-between text-sm">
+                    <span>{row.signal_state}</span>
+                    <span className="text-muted-foreground">{row.direction ?? "none"}</span>
+                  </div>
+                </div>
+              ))}
+              {checks.length === 0 && (
+                <div className="rounded-xl border border-border/70 p-3 text-center text-sm text-muted-foreground">No checks yet.</div>
+              )}
+            </div>
+
+            <div className="hidden md:block">
+              <Table>
+                <TableHeader>
                   <TableRow>
-                    <TableCell colSpan={4} className="text-center text-sm text-muted-foreground">No checks yet.</TableCell>
+                    <TableHead>When</TableHead>
+                    <TableHead>State</TableHead>
+                    <TableHead>Direction</TableHead>
+                    <TableHead className="text-right">Score</TableHead>
                   </TableRow>
-                )}
-              </TableBody>
-            </Table>
+                </TableHeader>
+                <TableBody>
+                  {checks.map((row) => (
+                    <TableRow key={row.id}>
+                      <TableCell className="text-xs text-muted-foreground">{new Date(row.checked_at).toLocaleString()}</TableCell>
+                      <TableCell>{row.signal_state}</TableCell>
+                      <TableCell>{row.direction ?? "none"}</TableCell>
+                      <TableCell className="text-right">{asNumber(row.setup_score, 0).toFixed(1)}</TableCell>
+                    </TableRow>
+                  ))}
+                  {checks.length === 0 && (
+                    <TableRow>
+                      <TableCell colSpan={4} className="text-center text-sm text-muted-foreground">No checks yet.</TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </div>
           </CardContent>
         </Card>
       </section>
@@ -191,41 +211,65 @@ export default async function AssetAnalysisDetailPage({
             <CardDescription>Latest 20 rows from `trading_signals`</CardDescription>
           </CardHeader>
           <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>ID</TableHead>
-                  <TableHead>When</TableHead>
-                  <TableHead>State</TableHead>
-                  <TableHead>Direction</TableHead>
-                  <TableHead className="text-right">Score</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {signals.map((row) => (
-                  <TableRow key={row.id}>
-                    <TableCell className="font-medium">
-                      <Link href={`/protected/signals/${row.id}`} className="text-primary hover:underline">
-                        #{row.id}
-                      </Link>
-                    </TableCell>
-                    <TableCell className="text-xs text-muted-foreground">{new Date(row.created_at).toLocaleString()}</TableCell>
-                    <TableCell>{row.signal_state}</TableCell>
-                    <TableCell>{row.direction}</TableCell>
-                    <TableCell className="text-right">{asNumber(row.setup_score, 0).toFixed(1)}</TableCell>
-                  </TableRow>
-                ))}
-                {signals.length === 0 && (
+            <div className="space-y-2 md:hidden">
+              {signals.map((row) => (
+                <Link
+                  key={row.id}
+                  href={`/protected/signals/${row.id}`}
+                  className="block rounded-xl border border-border/70 p-3"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="font-medium text-primary">#{row.id}</p>
+                    <p className="text-sm">{asNumber(row.setup_score, 0).toFixed(1)}</p>
+                  </div>
+                  <p className="text-xs text-muted-foreground">{new Date(row.created_at).toLocaleString()}</p>
+                  <div className="mt-1 flex items-center justify-between text-sm">
+                    <span>{row.signal_state}</span>
+                    <span className="text-muted-foreground">{row.direction}</span>
+                  </div>
+                </Link>
+              ))}
+              {signals.length === 0 && (
+                <div className="rounded-xl border border-border/70 p-3 text-center text-sm text-muted-foreground">No signals yet.</div>
+              )}
+            </div>
+
+            <div className="hidden md:block">
+              <Table>
+                <TableHeader>
                   <TableRow>
-                    <TableCell colSpan={5} className="text-center text-sm text-muted-foreground">No signals yet.</TableCell>
+                    <TableHead>ID</TableHead>
+                    <TableHead>When</TableHead>
+                    <TableHead>State</TableHead>
+                    <TableHead>Direction</TableHead>
+                    <TableHead className="text-right">Score</TableHead>
                   </TableRow>
-                )}
-              </TableBody>
-            </Table>
+                </TableHeader>
+                <TableBody>
+                  {signals.map((row) => (
+                    <TableRow key={row.id}>
+                      <TableCell className="font-medium">
+                        <Link href={`/protected/signals/${row.id}`} className="text-primary hover:underline">
+                          #{row.id}
+                        </Link>
+                      </TableCell>
+                      <TableCell className="text-xs text-muted-foreground">{new Date(row.created_at).toLocaleString()}</TableCell>
+                      <TableCell>{row.signal_state}</TableCell>
+                      <TableCell>{row.direction}</TableCell>
+                      <TableCell className="text-right">{asNumber(row.setup_score, 0).toFixed(1)}</TableCell>
+                    </TableRow>
+                  ))}
+                  {signals.length === 0 && (
+                    <TableRow>
+                      <TableCell colSpan={5} className="text-center text-sm text-muted-foreground">No signals yet.</TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </div>
           </CardContent>
         </Card>
       </section>
     </>
   );
 }
-
