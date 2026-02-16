@@ -3,7 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import { LogoutButton } from "@/components/logout-button";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { BarChart3, Bot, ChartCandlestick, Radar, ShieldAlert } from "lucide-react";
+import { ActivitySquare, BarChart3, Bot, ChartCandlestick, Radar, ShieldAlert } from "lucide-react";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { connection } from "next/server";
@@ -13,6 +13,7 @@ const links = [
   { href: "/protected/signals", label: "Signals", icon: ChartCandlestick },
   { href: "/protected/execution", label: "Execution", icon: Bot },
   { href: "/protected/operations", label: "Operations", icon: ShieldAlert },
+  { href: "/protected/analysis", label: "Analysis", icon: ActivitySquare },
   { href: "/protected/strategy", label: "Strategy", icon: Radar },
 ];
 

@@ -7,6 +7,8 @@ export interface TwelveCandle {
   volume?: string | null;
 }
 
+export type TwelveInterval = "1min" | "5min" | "15min" | "30min" | "45min" | "1h" | "4h" | "1day";
+
 interface TwelveTimeSeriesResponse {
   status?: string;
   code?: number;
@@ -51,9 +53,10 @@ function normalizeCandles(values: TwelveCandle[]): TwelveCandle[] {
   );
 }
 
-export async function fetchTwelveHourlyCandles(params: {
+export async function fetchTwelveCandles(params: {
   apiKey: string;
   symbol: string;
+  interval: TwelveInterval;
   startAt?: Date;
   endAt?: Date;
   outputsize?: number;
@@ -61,7 +64,7 @@ export async function fetchTwelveHourlyCandles(params: {
 }): Promise<TwelveCandle[]> {
   const url = new URL("https://api.twelvedata.com/time_series");
   url.searchParams.set("symbol", params.symbol);
-  url.searchParams.set("interval", "1h");
+  url.searchParams.set("interval", params.interval);
   url.searchParams.set("timezone", "UTC");
   url.searchParams.set("order", "ASC");
   url.searchParams.set("format", "JSON");
@@ -117,6 +120,25 @@ export async function fetchTwelveHourlyCandles(params: {
   return normalizeCandles(payload.values);
 }
 
+export async function fetchTwelveHourlyCandles(params: {
+  apiKey: string;
+  symbol: string;
+  startAt?: Date;
+  endAt?: Date;
+  outputsize?: number;
+  timeoutMs?: number;
+}): Promise<TwelveCandle[]> {
+  return fetchTwelveCandles({
+    apiKey: params.apiKey,
+    symbol: params.symbol,
+    interval: "1h",
+    startAt: params.startAt,
+    endAt: params.endAt,
+    outputsize: params.outputsize,
+    timeoutMs: params.timeoutMs,
+  });
+}
+
 function isRetryableStatus(statusCode: number): boolean {
   return statusCode === 429 || (statusCode >= 500 && statusCode <= 599);
 }
@@ -131,9 +153,10 @@ function toRetryableError(error: unknown): TwelveApiError {
   return new TwelveApiError("Twelve Data request failed: unknown error", 503);
 }
 
-export async function fetchTwelveHourlyCandlesWithRetry(params: {
+export async function fetchTwelveCandlesWithRetry(params: {
   apiKey: string;
   symbol: string;
+  interval: TwelveInterval;
   startAt?: Date;
   endAt?: Date;
   outputsize?: number;
@@ -149,9 +172,10 @@ export async function fetchTwelveHourlyCandlesWithRetry(params: {
   let attempt = 0;
   while (true) {
     try {
-      return await fetchTwelveHourlyCandles({
+      return await fetchTwelveCandles({
         apiKey: params.apiKey,
         symbol: params.symbol,
+        interval: params.interval,
         startAt: params.startAt,
         endAt: params.endAt,
         outputsize: params.outputsize,
@@ -173,4 +197,29 @@ export async function fetchTwelveHourlyCandlesWithRetry(params: {
       attempt += 1;
     }
   }
+}
+
+export async function fetchTwelveHourlyCandlesWithRetry(params: {
+  apiKey: string;
+  symbol: string;
+  startAt?: Date;
+  endAt?: Date;
+  outputsize?: number;
+  timeoutMs?: number;
+  maxRetries?: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+}): Promise<TwelveCandle[]> {
+  return fetchTwelveCandlesWithRetry({
+    apiKey: params.apiKey,
+    symbol: params.symbol,
+    interval: "1h",
+    startAt: params.startAt,
+    endAt: params.endAt,
+    outputsize: params.outputsize,
+    timeoutMs: params.timeoutMs,
+    maxRetries: params.maxRetries,
+    baseDelayMs: params.baseDelayMs,
+    maxDelayMs: params.maxDelayMs,
+  });
 }

@@ -14,7 +14,7 @@ async function upsertCandlesByRpc(params: {
   symbol: string;
   candles: CandleRowInput[];
   batchSize: number;
-  rpcName: "upsert_price_candles_1h" | "upsert_price_candles_1m";
+  rpcName: "upsert_price_candles_1h" | "upsert_price_candles_1m" | "upsert_price_candles_15m";
   source?: string;
 }): Promise<number> {
   if (!Array.isArray(params.candles) || params.candles.length === 0) {
@@ -31,7 +31,7 @@ async function upsertCandlesByRpc(params: {
       p_symbol: normalizedSymbol,
       p_rows: batch,
     };
-    if (params.rpcName === "upsert_price_candles_1m") {
+    if (params.rpcName === "upsert_price_candles_1m" || params.rpcName === "upsert_price_candles_15m") {
       rpcParams.p_source = params.source ?? "finnhub";
     }
 
@@ -74,6 +74,23 @@ export async function upsertMinuteCandles(
     candles,
     batchSize,
     rpcName: "upsert_price_candles_1m",
+    source,
+  });
+}
+
+export async function upsertFifteenMinuteCandles(
+  supabase: SupabaseClient,
+  symbol: string,
+  candles: CandleRowInput[],
+  batchSize = 1000,
+  source = "finnhub",
+): Promise<number> {
+  return upsertCandlesByRpc({
+    supabase,
+    symbol,
+    candles,
+    batchSize,
+    rpcName: "upsert_price_candles_15m",
     source,
   });
 }

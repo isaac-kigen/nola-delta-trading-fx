@@ -8,27 +8,37 @@ import {
   FinnhubApiError,
 } from "../_shared/finnhub.ts";
 import {
+  fetchTwelveCandlesWithRetry,
+  TwelveApiError,
+} from "../_shared/twelveData.ts";
+import {
   finishOpsFunctionRun,
   insertOpsAlert,
   startOpsFunctionRun,
 } from "../_shared/ops.ts";
 import {
-  FinnhubRateLimitError,
-  waitForFinnhubCallBudget,
+  ProviderRateLimitError,
+  waitForProviderCallBudget,
 } from "../_shared/rateLimit.ts";
 import { createSupabaseAdminClient } from "../_shared/supabaseAdmin.ts";
 
 interface BackfillRequest {
   symbol?: string;
   chunk_days?: number;
+  max_chunks_this_run?: number | string;
   start_date_utc?: string;
   end_date_utc?: string;
   dry_run?: boolean | string;
+  smart_mode?: boolean | string;
+  smart_lookback_days?: number | string;
 }
 
 const MINUTE_MS = 60_000;
 const DAY_MS = 24 * 60 * MINUTE_MS;
-const MAX_SAFE_CHUNK_DAYS = 30;
+const MAX_SAFE_CHUNK_DAYS_FINNHUB = 30;
+const MAX_SAFE_CHUNK_DAYS_TWELVE = 3;
+
+type MarketProvider = "finnhub" | "twelve_data";
 
 function parseBody(req: Request): Promise<BackfillRequest> {
   if (req.method !== "POST") {
@@ -54,9 +64,54 @@ function parseInteger(value: unknown, fallback: number): number {
   return Math.max(1, Math.trunc(parsed));
 }
 
-function clampChunkDays(value: number | undefined): number {
-  if (!value || Number.isNaN(value)) return 7;
-  return Math.min(MAX_SAFE_CHUNK_DAYS, Math.max(1, Math.trunc(value)));
+function parseOptionalPositiveInteger(value: unknown): number | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  const parsed = typeof value === "string" ? Number.parseInt(value, 10) : Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  const asInt = Math.trunc(parsed);
+  return asInt > 0 ? asInt : null;
+}
+
+function clampChunkDays(value: number | undefined, provider: MarketProvider): number {
+  const maxChunkDays = provider === "twelve_data"
+    ? MAX_SAFE_CHUNK_DAYS_TWELVE
+    : MAX_SAFE_CHUNK_DAYS_FINNHUB;
+  if (!value || Number.isNaN(value)) return Math.min(7, maxChunkDays);
+  return Math.min(maxChunkDays, Math.max(1, Math.trunc(value)));
+}
+
+function normalizeProvider(input: string | null | undefined): MarketProvider | null {
+  const v = (input ?? "").trim().toLowerCase();
+  if (!v) return null;
+  if (v === "finnhub") return "finnhub";
+  if (v === "twelve" || v === "twelve_data" || v === "twelvedata") return "twelve_data";
+  return null;
+}
+
+function resolveProvider(): MarketProvider {
+  const explicit = normalizeProvider(Deno.env.get("BACKFILL_DATA_PROVIDER") ?? Deno.env.get("MARKET_DATA_PROVIDER") ?? Deno.env.get("DATA_PROVIDER"));
+  if (explicit) return explicit;
+  if ((Deno.env.get("TWELVE_DATA_API_KEY") ?? "").trim()) return "twelve_data";
+  return "finnhub";
+}
+
+function requiredProviderKey(provider: MarketProvider): string {
+  if (provider === "twelve_data") return requiredEnv("TWELVE_DATA_API_KEY");
+  return requiredEnv("FINNHUB_API_KEY");
+}
+
+function providerLimits(provider: MarketProvider): { minuteLimit: number; dayLimit: number } {
+  if (provider === "twelve_data") {
+    return {
+      minuteLimit: parseInteger(Deno.env.get("TWELVE_API_CALLS_PER_MIN"), 8),
+      dayLimit: parseInteger(Deno.env.get("TWELVE_API_CALLS_PER_DAY"), 800),
+    };
+  }
+  return {
+    minuteLimit: parseInteger(Deno.env.get("FINNHUB_API_CALLS_PER_MIN"), 50),
+    dayLimit: parseInteger(Deno.env.get("FINNHUB_API_CALLS_PER_DAY"), 50_000),
+  };
 }
 
 function latestCompleteMinuteUtc(now = new Date()): Date {
@@ -144,6 +199,14 @@ function isMissingLockRpcError(message: string): boolean {
     (m.includes("could not find the function") || m.includes("does not exist"));
 }
 
+function isProviderNoDataError(error: unknown): boolean {
+  if (!(error instanceof TwelveApiError) && !(error instanceof FinnhubApiError)) {
+    return false;
+  }
+  const msg = String(error.message ?? "").toLowerCase();
+  return msg.includes("no data") || msg.includes("no_data");
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -179,19 +242,30 @@ serve(async (req) => {
   try {
     const body = await parseBody(req);
     const url = new URL(req.url);
+    const dataProvider = resolveProvider();
     const symbol = readSymbol(
       body.symbol ?? url.searchParams.get("symbol") ??
         Deno.env.get("FINNHUB_DEFAULT_SYMBOL") ?? Deno.env.get("TWELVE_DEFAULT_SYMBOL"),
     );
     const requestedChunkDays = parseInteger(body.chunk_days ?? url.searchParams.get("chunk_days"), 7);
-    const chunkDays = clampChunkDays(requestedChunkDays);
+    const chunkDays = clampChunkDays(requestedChunkDays, dataProvider);
     const chunkDaysCapped = chunkDays !== requestedChunkDays;
+    const requestedMaxChunksThisRun = parseOptionalPositiveInteger(
+      body.max_chunks_this_run ?? url.searchParams.get("max_chunks_this_run"),
+    );
     const dryRun = parseBoolean(body.dry_run ?? url.searchParams.get("dry_run"), false);
+    const smartModeDefault = parseBoolean(Deno.env.get("BACKFILL_SMART_MODE"), false);
+    const smartMode = parseBoolean(body.smart_mode ?? url.searchParams.get("smart_mode"), smartModeDefault);
+    const smartLookbackDefault = parseInteger(Deno.env.get("BACKFILL_SMART_LOOKBACK_DAYS"), 365);
+    const smartLookbackDays = parseInteger(
+      body.smart_lookback_days ?? url.searchParams.get("smart_lookback_days"),
+      smartLookbackDefault,
+    );
     const skipEmptyChunks = parseBoolean(Deno.env.get("BACKFILL_SKIP_EMPTY_CHUNKS"), true);
 
     if (!symbol) {
       return jsonResponse(
-        { error: "symbol is required (body.symbol, query param, or FINNHUB_DEFAULT_SYMBOL)" },
+        { error: "symbol is required (body.symbol, query param, or FINNHUB_DEFAULT_SYMBOL/TWELVE_DEFAULT_SYMBOL)" },
         400,
       );
     }
@@ -212,10 +286,14 @@ serve(async (req) => {
       traceId,
       payload: {
         symbol,
+        data_provider: dataProvider,
         chunk_days_requested: requestedChunkDays,
         chunk_days_effective: chunkDays,
         chunk_days_capped_for_outputsize: chunkDaysCapped,
+        max_chunks_this_run_requested: requestedMaxChunksThisRun,
         dry_run: dryRun,
+        smart_mode: smartMode,
+        smart_lookback_days: smartLookbackDays,
         start_date_utc: startDateInput,
         end_date_utc: endDateInput,
       },
@@ -283,17 +361,32 @@ serve(async (req) => {
       }
     }
 
-    const apiKey = requiredEnv("FINNHUB_API_KEY");
-    const fetchMaxRetries = parseInteger(Deno.env.get("FINNHUB_FETCH_MAX_RETRIES"), 3);
-    const fetchBaseDelayMs = parseInteger(Deno.env.get("FINNHUB_FETCH_BASE_DELAY_MS"), 400);
-    const fetchTimeoutMs = parseInteger(Deno.env.get("FINNHUB_FETCH_TIMEOUT_MS"), 15_000);
-    const maxChunksPerRun = parseInteger(Deno.env.get("BACKFILL_MAX_CHUNKS_PER_RUN"), 120);
+    const apiKey = requiredProviderKey(dataProvider);
+    const fetchMaxRetries = parseInteger(
+      Deno.env.get(dataProvider === "twelve_data" ? "TWELVE_FETCH_MAX_RETRIES" : "FINNHUB_FETCH_MAX_RETRIES"),
+      3,
+    );
+    const fetchBaseDelayMs = parseInteger(
+      Deno.env.get(dataProvider === "twelve_data" ? "TWELVE_FETCH_BASE_DELAY_MS" : "FINNHUB_FETCH_BASE_DELAY_MS"),
+      400,
+    );
+    const fetchTimeoutMs = parseInteger(
+      Deno.env.get(dataProvider === "twelve_data" ? "TWELVE_FETCH_TIMEOUT_MS" : "FINNHUB_FETCH_TIMEOUT_MS"),
+      15_000,
+    );
+    const maxChunksPerRunConfigured = parseInteger(Deno.env.get("BACKFILL_MAX_CHUNKS_PER_RUN"), 120);
+    const maxChunksPerRun = requestedMaxChunksThisRun !== null
+      ? Math.min(maxChunksPerRunConfigured, requestedMaxChunksThisRun)
+      : maxChunksPerRunConfigured;
+    const limits = providerLimits(dataProvider);
 
     const latestCompleteMinute = latestCompleteMinuteUtc();
     let requestedStart: Date;
     let requestedEnd: Date;
-    let rangeMode: "explicit_dates" | "default_anchor" = "default_anchor";
+    let rangeMode: "explicit_dates" | "default_anchor" | "smart_oldest_extend" = "default_anchor";
     let latestSavedAnchorUtc: string | null = null;
+    let oldestSavedAnchorUtc: string | null = null;
+    let smartModeFallbackReason: string | null = null;
     let clampedEnd = false;
 
     if (startDateInput && endDateInput) {
@@ -318,10 +411,37 @@ serve(async (req) => {
         throw new Error(`Failed reading latest saved candle for anchor: ${latestSavedError.message}`);
       }
 
-      const anchor = latestSaved?.candle_time ? new Date(String(latestSaved.candle_time)) : latestCompleteMinute;
-      latestSavedAnchorUtc = anchor.toISOString();
-      requestedEnd = floorToMinuteUtc(anchor);
-      requestedStart = floorToMinuteUtc(new Date(requestedEnd.getTime() - 365 * DAY_MS));
+      const latestAnchor = latestSaved?.candle_time ? new Date(String(latestSaved.candle_time)) : latestCompleteMinute;
+      latestSavedAnchorUtc = latestAnchor.toISOString();
+
+      if (smartMode) {
+        const { data: oldestSaved, error: oldestSavedError } = await supabase
+          .from("price_candles_1m")
+          .select("candle_time")
+          .eq("symbol", symbol)
+          .order("candle_time", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        if (oldestSavedError) {
+          throw new Error(`Failed reading oldest saved candle for smart anchor: ${oldestSavedError.message}`);
+        }
+
+        if (oldestSaved?.candle_time) {
+          rangeMode = "smart_oldest_extend";
+          const oldestAnchor = floorToMinuteUtc(new Date(String(oldestSaved.candle_time)));
+          oldestSavedAnchorUtc = oldestAnchor.toISOString();
+          requestedEnd = new Date(oldestAnchor.getTime() - MINUTE_MS);
+          requestedStart = floorToMinuteUtc(new Date(requestedEnd.getTime() - smartLookbackDays * DAY_MS));
+        } else {
+          smartModeFallbackReason = "no_existing_data_for_symbol";
+          requestedEnd = floorToMinuteUtc(latestAnchor);
+          requestedStart = floorToMinuteUtc(new Date(requestedEnd.getTime() - 365 * DAY_MS));
+        }
+      } else {
+        requestedEnd = floorToMinuteUtc(latestAnchor);
+        requestedStart = floorToMinuteUtc(new Date(requestedEnd.getTime() - 365 * DAY_MS));
+      }
     }
 
     if (requestedEnd > latestCompleteMinute) {
@@ -351,6 +471,8 @@ serve(async (req) => {
         reason: "max_chunks_per_run_exceeded",
         estimated_chunks: estimatedChunks,
         max_chunks_per_run: maxChunksPerRun,
+        max_chunks_per_run_configured: maxChunksPerRunConfigured,
+        max_chunks_this_run_requested: requestedMaxChunksThisRun,
       };
       return jsonResponse(
         {
@@ -358,6 +480,8 @@ serve(async (req) => {
           trace_id: traceId,
           estimated_chunks: estimatedChunks,
           max_chunks_per_run: maxChunksPerRun,
+          max_chunks_per_run_configured: maxChunksPerRunConfigured,
+          max_chunks_this_run_requested: requestedMaxChunksThisRun,
         },
         422,
       );
@@ -370,22 +494,48 @@ serve(async (req) => {
       const chunkStart = new Date(cursor);
       const chunkEnd = new Date(Math.min(hardEndMs, cursor + chunkMs - MINUTE_MS));
 
-      await waitForFinnhubCallBudget(supabase, 1, {
+      await waitForProviderCallBudget({
+        supabase,
+        provider: dataProvider,
+        calls: 1,
+        minuteLimit: limits.minuteLimit,
+        dayLimit: limits.dayLimit,
         maxMinuteRetries: 10,
         maxWaitMs: 15 * 60_000,
       });
       progress.api_calls_used += 1;
 
-      const candles = await fetchFinnhubCandlesWithRetry({
-        apiKey,
-        symbol,
-        resolution: "1",
-        from: chunkStart,
-        to: chunkEnd,
-        timeoutMs: fetchTimeoutMs,
-        maxRetries: fetchMaxRetries,
-        baseDelayMs: fetchBaseDelayMs,
-      });
+      let candles: Awaited<ReturnType<typeof fetchTwelveCandlesWithRetry>> = [];
+      try {
+        candles = dataProvider === "twelve_data"
+          ? await fetchTwelveCandlesWithRetry({
+            apiKey,
+            symbol,
+            interval: "1min",
+            startAt: chunkStart,
+            endAt: chunkEnd,
+            outputsize: 5_000,
+            timeoutMs: fetchTimeoutMs,
+            maxRetries: fetchMaxRetries,
+            baseDelayMs: fetchBaseDelayMs,
+          })
+          : await fetchFinnhubCandlesWithRetry({
+            apiKey,
+            symbol,
+            resolution: "1",
+            from: chunkStart,
+            to: chunkEnd,
+            timeoutMs: fetchTimeoutMs,
+            maxRetries: fetchMaxRetries,
+            baseDelayMs: fetchBaseDelayMs,
+          });
+      } catch (error) {
+        if (skipEmptyChunks && isProviderNoDataError(error)) {
+          candles = [];
+        } else {
+          throw error;
+        }
+      }
 
       progress.fetched_rows += candles.length;
       if (candles.length === 0 && skipEmptyChunks) {
@@ -396,7 +546,7 @@ serve(async (req) => {
       }
 
       if (!dryRun && candles.length > 0) {
-        const changed = await upsertMinuteCandles(supabase, symbol, candles, 2_000, "finnhub");
+        const changed = await upsertMinuteCandles(supabase, symbol, candles, 2_000, dataProvider);
         progress.saved_rows += changed;
       } else if (dryRun) {
         progress.saved_rows += candles.length;
@@ -414,9 +564,13 @@ serve(async (req) => {
       chunk_days_capped_for_outputsize: chunkDaysCapped,
       dry_run: dryRun,
       skip_empty_chunks: skipEmptyChunks,
-      data_provider: "finnhub",
+      data_provider: dataProvider,
       range_mode: rangeMode,
       latest_saved_anchor_utc: latestSavedAnchorUtc,
+      oldest_saved_anchor_utc: oldestSavedAnchorUtc,
+      smart_mode: smartMode,
+      smart_lookback_days: smartLookbackDays,
+      smart_mode_fallback_reason: smartModeFallbackReason,
       requested_start_date_utc: startDateInput,
       requested_end_date_utc: endDateInput,
       clamped_end_to_latest_complete_minute: clampedEnd,
@@ -425,6 +579,8 @@ serve(async (req) => {
       total_minutes_requested: totalMinutesRequested,
       estimated_chunks: estimatedChunks,
       max_chunks_per_run: maxChunksPerRun,
+      max_chunks_per_run_configured: maxChunksPerRunConfigured,
+      max_chunks_this_run_requested: requestedMaxChunksThisRun,
       chunks_completed: progress.chunks_completed,
       fetched_rows: progress.fetched_rows,
       saved_rows: progress.saved_rows,
@@ -443,11 +599,12 @@ serve(async (req) => {
       partial_progress: progress,
     };
 
-    if (error instanceof FinnhubRateLimitError) {
+    if (error instanceof ProviderRateLimitError) {
       return jsonResponse(
         {
           error: error.message,
           reason: error.reason,
+          provider: error.provider,
           wait_seconds: error.waitSeconds,
           minute_remaining: error.minuteRemaining,
           day_remaining: error.dayRemaining,
@@ -458,7 +615,7 @@ serve(async (req) => {
       );
     }
 
-    if (error instanceof FinnhubApiError) {
+    if (error instanceof FinnhubApiError || error instanceof TwelveApiError) {
       return jsonResponse(
         {
           error: error.message,

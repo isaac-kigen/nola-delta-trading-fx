@@ -318,6 +318,106 @@ async function loadRecent1mCandles(params: {
   return rows;
 }
 
+async function loadRecent15mCandles(params: {
+  supabase: SupabaseClient;
+  symbol: string;
+  limit: number;
+  pageSize: number;
+}): Promise<Candle1h[]> {
+  const target = Math.max(1, Math.trunc(params.limit));
+  const pageSize = Math.max(100, Math.min(2_000, Math.trunc(params.pageSize)));
+  const rows: Candle1h[] = [];
+  let offset = 0;
+
+  while (rows.length < target) {
+    const remaining = target - rows.length;
+    const fetchCount = Math.min(pageSize, remaining);
+    const rangeFrom = offset;
+    const rangeTo = offset + fetchCount - 1;
+
+    const { data, error } = await params.supabase
+      .from("price_candles_15m")
+      .select("candle_time, open, high, low, close")
+      .eq("symbol", params.symbol)
+      .order("candle_time", { ascending: false })
+      .range(rangeFrom, rangeTo);
+
+    if (error) {
+      throw new Error(`Failed reading recent 15m candles: ${error.message}`);
+    }
+
+    const chunk = (data ?? [])
+      .map((row) => ({
+        candle_time: String(row.candle_time),
+        open: Number(row.open),
+        high: Number(row.high),
+        low: Number(row.low),
+        close: Number(row.close),
+      }))
+      .filter((row) =>
+        Number.isFinite(new Date(row.candle_time).getTime()) &&
+        Number.isFinite(row.open) &&
+        Number.isFinite(row.high) &&
+        Number.isFinite(row.low) &&
+        Number.isFinite(row.close)
+      );
+
+    if (chunk.length === 0) break;
+    rows.push(...chunk);
+
+    if (chunk.length < fetchCount) break;
+    offset += chunk.length;
+  }
+
+  return rows;
+}
+
+function expand15mToSynthetic1m(rows15mAsc: Candle1h[]): Candle1h[] {
+  const out: Candle1h[] = [];
+  for (const row of rows15mAsc) {
+    const startMs = new Date(row.candle_time).getTime();
+    if (!Number.isFinite(startMs)) continue;
+    for (let i = 0; i < 15; i += 1) {
+      const ts = new Date(startMs + i * 60_000).toISOString();
+      out.push({
+        candle_time: ts,
+        open: row.open,
+        high: row.high,
+        low: row.low,
+        close: row.close,
+      });
+    }
+  }
+  return out;
+}
+
+function mergeSyntheticAndReal1m(params: {
+  syntheticAsc: Candle1h[];
+  realDesc: Candle1h[];
+  maxRows: number;
+}): Candle1h[] {
+  const byTs = new Map<number, Candle1h>();
+
+  for (const row of params.syntheticAsc) {
+    const ts = new Date(row.candle_time).getTime();
+    if (!Number.isFinite(ts)) continue;
+    byTs.set(ts, row);
+  }
+
+  for (const row of params.realDesc) {
+    const ts = new Date(row.candle_time).getTime();
+    if (!Number.isFinite(ts)) continue;
+    byTs.set(ts, row);
+  }
+
+  const rowsAsc = [...byTs.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map((entry) => entry[1]);
+
+  if (rowsAsc.length <= params.maxRows) return rowsAsc;
+  return rowsAsc.slice(rowsAsc.length - params.maxRows);
+}
+
 async function resolveQuoteToUsdRate(params: {
   supabase: SupabaseClient;
   symbol: string;
@@ -2298,6 +2398,28 @@ export async function runTradingOpportunityCheck(params: {
     2_000,
     120_000,
   );
+  const max15mCandles = toPositiveInt(
+    Deno.env.get("STRUCTURE_MAX_15M_CANDLES"),
+    Math.ceil(maxLtfCandles / 15) + 160,
+    160,
+    20_000,
+  );
+  const maxReal1mBurstCandles = toPositiveInt(
+    Deno.env.get("STRUCTURE_REAL_1M_BURST_LIMIT"),
+    600,
+    0,
+    8_000,
+  );
+  const requireReal1mTrigger = toBoolean(
+    Deno.env.get("PHOTON_REQUIRE_REAL_1M_TRIGGER"),
+    true,
+  );
+  const real1mFreshnessMinutes = toPositiveInt(
+    Deno.env.get("PHOTON_REAL_1M_FRESHNESS_MINUTES"),
+    20,
+    1,
+    240,
+  );
 
   const structureFetchPageSize = toPositiveInt(
     Deno.env.get("STRUCTURE_FETCH_PAGE_SIZE"),
@@ -2305,24 +2427,51 @@ export async function runTradingOpportunityCheck(params: {
     200,
     5_000,
   );
-  const rawCandles = await loadRecent1mCandles({
+  const raw15mCandles = await loadRecent15mCandles({
     supabase: params.supabase,
     symbol: normalizedSymbol,
-    limit: maxLtfCandles,
+    limit: max15mCandles,
     pageSize: structureFetchPageSize,
   });
+  const raw1mCandles = maxReal1mBurstCandles > 0
+    ? await loadRecent1mCandles({
+      supabase: params.supabase,
+      symbol: normalizedSymbol,
+      limit: maxReal1mBurstCandles,
+      pageSize: structureFetchPageSize,
+    })
+    : [];
 
-  const latestKnownPrice = toFiniteNumber(params.latestPrice) ?? toFiniteNumber(rawCandles[0]?.close) ?? 0;
+  const candles15mAsc = raw15mCandles.slice().reverse();
+  const synthetic1mAsc = expand15mToSynthetic1m(candles15mAsc);
+  const candlesAsc = mergeSyntheticAndReal1m({
+    syntheticAsc: synthetic1mAsc,
+    realDesc: raw1mCandles,
+    maxRows: maxLtfCandles,
+  });
+  const latestReal1mCandle = raw1mCandles.length > 0 ? raw1mCandles[0] : null;
+  const latestMergedCandle = candlesAsc.length > 0 ? candlesAsc[candlesAsc.length - 1] : null;
+
+  const latestKnownPrice = toFiniteNumber(params.latestPrice) ??
+    toFiniteNumber(latestReal1mCandle?.close) ??
+    toFiniteNumber(raw15mCandles[0]?.close) ??
+    0;
   const latestKnownTime = params.latestCandleTimeUtc ??
-    (rawCandles[0]?.candle_time ? String(rawCandles[0].candle_time) : null);
+    (latestReal1mCandle?.candle_time
+      ? String(latestReal1mCandle.candle_time)
+      : raw15mCandles[0]?.candle_time
+      ? String(raw15mCandles[0].candle_time)
+      : latestMergedCandle?.candle_time
+      ? String(latestMergedCandle.candle_time)
+      : null);
 
-  const candlesAsc: Candle1h[] = rawCandles.slice().reverse();
-
-  if (!symbolConfig.enabled || candlesAsc.length < 2000) {
-    const reason = !symbolConfig.enabled ? "symbol_disabled" : "insufficient_1m_history";
+  if (!symbolConfig.enabled || candlesAsc.length < 2500) {
+    const reason = !symbolConfig.enabled ? "symbol_disabled" : "insufficient_15m_or_1m_history";
     const details = {
       reason,
-      available_1m_candles: candlesAsc.length,
+      available_merged_1m_candles: candlesAsc.length,
+      available_real_1m_candles: raw1mCandles.length,
+      available_15m_candles: raw15mCandles.length,
       latest_known_time_utc: latestKnownTime,
     };
 
@@ -2392,6 +2541,13 @@ export async function runTradingOpportunityCheck(params: {
   }
 
   const latestCandle = candlesAsc[candlesAsc.length - 1];
+  const latestReal1mAgeMinutes = latestReal1mCandle
+    ? Math.max(
+      0,
+      (new Date(latestCandle.candle_time).getTime() - new Date(latestReal1mCandle.candle_time).getTime()) / 60_000,
+    )
+    : null;
+  const hasFreshReal1m = latestReal1mAgeMinutes !== null && latestReal1mAgeMinutes <= real1mFreshnessMinutes;
   const latestPrice = toFiniteNumber(params.latestPrice) ?? latestCandle.close;
   const highs = candlesAsc.map((c) => c.high);
   const lows = candlesAsc.map((c) => c.low);
@@ -2399,13 +2555,15 @@ export async function runTradingOpportunityCheck(params: {
   const atrSeries = atr(highs, lows, closes, 14);
   const currentAtr = atrSeries[atrSeries.length - 1] ?? (Math.abs(latestCandle.high - latestCandle.low) || pipSize(normalizedSymbol));
 
-  await reconcileSymbolSignals({
-    supabase: params.supabase,
-    symbol: normalizedSymbol,
-    traceId,
-    latestCandle,
-    atrValue: currentAtr,
-  });
+  if (latestReal1mCandle) {
+    await reconcileSymbolSignals({
+      supabase: params.supabase,
+      symbol: normalizedSymbol,
+      traceId,
+      latestCandle: latestReal1mCandle,
+      atrValue: currentAtr,
+    });
+  }
 
   const photon = evaluatePhotonStructure({
     candles1m: candlesAsc,
@@ -2440,6 +2598,9 @@ export async function runTradingOpportunityCheck(params: {
 
   const regimeFailReasons: string[] = [];
   if (!photon.valid) regimeFailReasons.push(photon.reason);
+  if (photon.valid && requireReal1mTrigger && !hasFreshReal1m) {
+    regimeFailReasons.push("watch_1m_data_required");
+  }
   if (!sessionPass) regimeFailReasons.push("session_filter_blocked");
   if (!newsPass) regimeFailReasons.push("high_impact_news_blocked");
   if (!spreadPass) regimeFailReasons.push("spread_filter_blocked");
@@ -2770,10 +2931,17 @@ export async function runTradingOpportunityCheck(params: {
   });
 
   const details: Record<string, unknown> = {
-    timeframe: "1m",
+    timeframe: "15m_primary_with_1m_watch",
     mtf_timeframe: "15m",
     htf_timeframe: "4h",
-    data_source: "price_candles_1m",
+    data_source: "price_candles_15m+price_candles_1m_watch",
+    available_15m_candles: raw15mCandles.length,
+    available_real_1m_candles: raw1mCandles.length,
+    latest_real_1m_age_minutes: latestReal1mAgeMinutes === null ? null : round(latestReal1mAgeMinutes, 3),
+    real_1m_freshness_minutes: real1mFreshnessMinutes,
+    has_fresh_real_1m: hasFreshReal1m,
+    available_merged_1m_candles: candlesAsc.length,
+    requires_real_1m_trigger: requireReal1mTrigger,
     photon,
     cycle_id: cycleId,
     regime_fail_reasons: regimeFailReasons,
