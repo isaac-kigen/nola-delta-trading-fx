@@ -395,6 +395,43 @@ async function fetchLatestCandleFromProvider(params: {
   return candles.find((row) => row.datetime === targetText) ?? null;
 }
 
+async function fetchCandleRangeFromProvider(params: {
+  provider: MarketProvider;
+  symbol: string;
+  interval: "1m" | "15m";
+  start: Date;
+  endExclusive: Date;
+  timeoutMs: number;
+  maxRetries: number;
+  baseDelayMs: number;
+}): Promise<CandleRow[]> {
+  const providerApiKey = requiredProviderKey(params.provider);
+  if (params.provider === "finnhub") {
+    return await fetchFinnhubCandlesWithRetry({
+      apiKey: providerApiKey,
+      symbol: params.symbol,
+      resolution: params.interval === "1m" ? "1" : "15",
+      from: params.start,
+      to: new Date(params.endExclusive.getTime() - 1000),
+      timeoutMs: params.timeoutMs,
+      maxRetries: params.maxRetries,
+      baseDelayMs: params.baseDelayMs,
+    });
+  }
+
+  return await fetchTwelveCandlesWithRetry({
+    apiKey: providerApiKey,
+    symbol: params.symbol,
+    interval: params.interval === "1m" ? "1min" : "15min",
+    startAt: params.start,
+    endAt: new Date(params.endExclusive.getTime() - 1000),
+    outputsize: 5_000,
+    timeoutMs: params.timeoutMs,
+    maxRetries: params.maxRetries,
+    baseDelayMs: params.baseDelayMs,
+  });
+}
+
 async function withProviderFallback(params: {
   primary: MarketProvider;
   fallback: MarketProvider | null;
@@ -452,6 +489,66 @@ async function withProviderFallback(params: {
     });
 
     return { candle, providerUsed: params.fallback! };
+  }
+}
+
+async function withProviderFallbackRange(params: {
+  primary: MarketProvider;
+  fallback: MarketProvider | null;
+  symbol: string;
+  interval: "1m" | "15m";
+  start: Date;
+  endExclusive: Date;
+  timeoutMs: number;
+  maxRetries: number;
+  baseDelayMs: number;
+  supabase: ReturnType<typeof createSupabaseAdminClient>;
+  traceId: string;
+}): Promise<{ candles: CandleRow[]; providerUsed: MarketProvider }> {
+  try {
+    const candles = await fetchCandleRangeFromProvider({
+      provider: params.primary,
+      symbol: params.symbol,
+      interval: params.interval,
+      start: params.start,
+      endExclusive: params.endExclusive,
+      timeoutMs: params.timeoutMs,
+      maxRetries: params.maxRetries,
+      baseDelayMs: params.baseDelayMs,
+    });
+    return { candles, providerUsed: params.primary };
+  } catch (error) {
+    const shouldFallback = params.fallback !== null &&
+      params.fallback !== params.primary &&
+      ((error instanceof FinnhubApiError && error.statusCode === 403) ||
+        (error instanceof TwelveApiError && (error.statusCode === 401 || error.statusCode === 403)));
+
+    if (!shouldFallback) throw error;
+
+    await insertOpsAlert({
+      supabase: params.supabase,
+      traceId: params.traceId,
+      alertType: "market_data_provider_fallback",
+      severity: "warning",
+      message: `Falling back from ${params.primary} to ${params.fallback} for ${params.symbol}`,
+      payload: {
+        interval: params.interval,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
+
+    const candles = await fetchCandleRangeFromProvider({
+      provider: params.fallback!,
+      symbol: params.symbol,
+      interval: params.interval,
+      start: params.start,
+      endExclusive: params.endExclusive,
+      timeoutMs: params.timeoutMs,
+      maxRetries: params.maxRetries,
+      baseDelayMs: params.baseDelayMs,
+    });
+
+    return { candles, providerUsed: params.fallback! };
   }
 }
 
@@ -540,6 +637,10 @@ serve(async (req) => {
     const watchBurstMinutes = parseInteger(Deno.env.get("SYNC_WATCH_BURST_MINUTES"), 20);
     const maxWatchSymbols = parseInteger(Deno.env.get("SYNC_WATCH_MAX_SYMBOLS"), 1);
     const watchBudgetReserve = parseInteger(Deno.env.get("SYNC_WATCH_MIN_DAY_REMAINING"), 30);
+    const catchupEnabled = parseBoolean(Deno.env.get("SYNC_BASELINE_CATCHUP_ENABLED"), true);
+    const catchupMaxBarsPerSymbol = parseInteger(Deno.env.get("SYNC_BASELINE_CATCHUP_MAX_BARS_PER_SYMBOL"), 16);
+    const catchupMaxCallsPerRun = parseInteger(Deno.env.get("SYNC_BASELINE_CATCHUP_MAX_CALLS_PER_RUN"), 12);
+    const catchupBudgetReserve = parseInteger(Deno.env.get("SYNC_BASELINE_CATCHUP_MIN_DAY_REMAINING"), 40);
 
     const { primary: primaryProvider, fallback: fallbackProvider } = resolveProviders();
     const primaryLimits = providerLimits(primaryProvider);
@@ -655,6 +756,7 @@ serve(async (req) => {
     let apiCallsUsed = 0;
     let baselineCallsUsed = 0;
     let watchCallsUsed = 0;
+    let catchupCallsUsed = 0;
 
     const baselineDue = forceBaseline15m || sessionActive;
 
@@ -672,19 +774,55 @@ serve(async (req) => {
 
       // 15m baseline stage
       if (baselineDue) {
-        const { data: existing15m, error: existing15mError } = await supabase
+        const { data: latest15m, error: latest15mErrorLookup } = await supabase
           .from("price_candles_15m")
           .select("candle_time")
           .eq("symbol", symbol)
-          .gte("candle_time", target15mStart.toISOString())
-          .lt("candle_time", target15mEnd.toISOString())
+          .order("candle_time", { ascending: false })
+          .limit(1)
           .maybeSingle();
 
-        if (existing15mError) {
-          throw new Error(`Failed checking existing 15m candle: ${existing15mError.message}`);
+        if (latest15mErrorLookup) {
+          throw new Error(`Failed checking latest 15m candle: ${latest15mErrorLookup.message}`);
         }
 
-        if (!existing15m) {
+        const latestSaved15mTime = latest15m?.candle_time ? new Date(String(latest15m.candle_time)) : null;
+        const runtimeBaselineTime = runtime?.last_baseline_15m_candle_time
+          ? new Date(String(runtime.last_baseline_15m_candle_time))
+          : null;
+
+        let fetch15mStart = target15mStart;
+        if (catchupEnabled && runtimeBaselineTime && runtimeBaselineTime.getTime() < target15mStart.getTime()) {
+          fetch15mStart = new Date(runtimeBaselineTime.getTime() + FIFTEEN_MIN_MS);
+        } else if (catchupEnabled && latestSaved15mTime && latestSaved15mTime.getTime() < target15mStart.getTime()) {
+          fetch15mStart = new Date(latestSaved15mTime.getTime() + FIFTEEN_MIN_MS);
+        }
+
+        const missingBars = fetch15mStart.getTime() > target15mStart.getTime()
+          ? 0
+          : Math.floor((target15mStart.getTime() - fetch15mStart.getTime()) / FIFTEEN_MIN_MS) + 1;
+        const barsToFetch = Math.max(0, Math.min(missingBars, catchupMaxBarsPerSymbol));
+        const fetch15mEndExclusive = barsToFetch > 0
+          ? new Date(fetch15mStart.getTime() + barsToFetch * FIFTEEN_MIN_MS)
+          : target15mEnd;
+
+        if (barsToFetch > 0) {
+          if (!forceBaseline15m && catchupCallsUsed >= catchupMaxCallsPerRun) {
+            symbolResult.baseline_15m = {
+              skipped: true,
+              reason: "catchup_call_cap_reached",
+              missing_bars_estimate: missingBars,
+              bars_scheduled: barsToFetch,
+            };
+          } else if (!forceBaseline15m && dayRemainingEstimate <= catchupBudgetReserve) {
+            symbolResult.baseline_15m = {
+              skipped: true,
+              reason: "catchup_budget_guard",
+              day_remaining: dayRemainingEstimate,
+              missing_bars_estimate: missingBars,
+              bars_scheduled: barsToFetch,
+            };
+          } else {
           const reserve = await waitForProviderCallBudget({
             supabase,
             provider: primaryProvider,
@@ -696,13 +834,13 @@ serve(async (req) => {
           });
 
           dayRemainingEstimate = reserve.day_remaining;
-          const fetched = await withProviderFallback({
+          const fetched = await withProviderFallbackRange({
             primary: primaryProvider,
             fallback: fallbackProvider,
             symbol,
             interval: "15m",
-            targetStart: target15mStart,
-            targetEnd: target15mEnd,
+            start: fetch15mStart,
+            endExclusive: fetch15mEndExclusive,
             timeoutMs: fetchTimeoutMs,
             maxRetries: fetchMaxRetries,
             baseDelayMs: fetchBaseDelayMs,
@@ -712,33 +850,43 @@ serve(async (req) => {
 
           apiCallsUsed += 1;
           baselineCallsUsed += 1;
+          catchupCallsUsed += 1;
 
-          if (fetched.candle) {
+          if (fetched.candles.length > 0) {
             const saved15m = await upsertFifteenMinuteCandles(
               supabase,
               symbol,
-              [fetched.candle],
-              200,
+              fetched.candles,
+              500,
               fetched.providerUsed,
             );
             symbolResult.baseline_15m = {
-              fetched: 1,
+              fetched: fetched.candles.length,
               saved: saved15m,
-              candle_time_utc: fetched.candle.datetime,
+              from_utc: fetched.candles[0]?.datetime ?? formatUtcDateTime(fetch15mStart),
+              to_utc: fetched.candles[fetched.candles.length - 1]?.datetime ?? formatUtcDateTime(target15mStart),
+              missing_bars_estimate: missingBars,
+              bars_scheduled: barsToFetch,
               provider: fetched.providerUsed,
             };
           } else {
             symbolResult.baseline_15m = {
               fetched: 0,
               saved: 0,
-              reason: "no_target_complete_15m_candle_returned",
+              reason: "no_15m_candles_returned_for_range",
+              from_utc: formatUtcDateTime(fetch15mStart),
+              to_utc: formatUtcDateTime(new Date(fetch15mEndExclusive.getTime() - 1000)),
+              missing_bars_estimate: missingBars,
+              bars_scheduled: barsToFetch,
             };
+          }
           }
         } else {
           symbolResult.baseline_15m = {
             skipped: true,
-            reason: "latest_complete_15m_already_saved",
-            candle_time_utc: existing15m.candle_time,
+            reason: "baseline_15m_up_to_date",
+            candle_time_utc: latest15m?.candle_time ?? null,
+            missing_bars_estimate: 0,
           };
         }
 
@@ -763,6 +911,8 @@ serve(async (req) => {
             volume: row.volume === null ? null : String(row.volume),
           }))
           .reverse();
+
+        const latestBaselineCheckpoint = rowsAsc.length > 0 ? rowsAsc[rowsAsc.length - 1].datetime : null;
 
         const setup = evaluate15mSetup(symbol, rowsAsc);
         symbolResult.baseline_setup = {
@@ -789,7 +939,7 @@ serve(async (req) => {
               watch_reason: setup.reason,
               watch_direction: setup.direction,
               watch_setup_score: setup.setupScore,
-              last_baseline_15m_candle_time: target15mIso,
+              last_baseline_15m_candle_time: latestBaselineCheckpoint ?? target15mIso,
               last_provider: primaryProvider,
               updated_at: nowUtc.toISOString(),
             }, { onConflict: "symbol" });
@@ -830,6 +980,20 @@ serve(async (req) => {
               ? "budget_reserve_guard"
               : "watch_capacity_reached",
           };
+
+          await supabase
+            .from("sync_symbol_runtime_state")
+            .upsert({
+              symbol,
+              watch_mode_active: watchActive,
+              watch_until: watchActive ? watchUntilIso : null,
+              watch_reason: watchActive ? runtime?.watch_reason ?? setup.reason : setup.reason,
+              watch_direction: watchActive ? runtime?.watch_direction ?? setup.direction : setup.direction,
+              watch_setup_score: watchActive ? runtime?.watch_setup_score ?? setup.setupScore : setup.setupScore,
+              last_baseline_15m_candle_time: latestBaselineCheckpoint ?? target15mIso,
+              last_provider: primaryProvider,
+              updated_at: nowUtc.toISOString(),
+            }, { onConflict: "symbol" });
         }
       } else {
         symbolResult.baseline_15m = {
@@ -1089,6 +1253,7 @@ serve(async (req) => {
       symbols_processed: results.length,
       api_calls_used: apiCallsUsed,
       baseline_15m_calls_used: baselineCallsUsed,
+      baseline_15m_catchup_calls_used: catchupCallsUsed,
       watch_1m_calls_used: watchCallsUsed,
       run_opportunity_check: runOpportunityCheck,
       check_function_name: "check-trading-opportunity (internal-shared-execution)",
@@ -1101,6 +1266,10 @@ serve(async (req) => {
         watch_burst_minutes: watchBurstMinutes,
         watch_max_symbols: maxWatchSymbols,
         watch_budget_reserve_calls: watchBudgetReserve,
+        baseline_catchup_enabled: catchupEnabled,
+        baseline_catchup_max_bars_per_symbol: catchupMaxBarsPerSymbol,
+        baseline_catchup_max_calls_per_run: catchupMaxCallsPerRun,
+        baseline_catchup_budget_reserve_calls: catchupBudgetReserve,
       },
       results,
     };

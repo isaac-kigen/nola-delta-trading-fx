@@ -23,6 +23,13 @@ type LatestSignal = {
   setup_score: number | string | null;
 };
 
+type GapStatus = {
+  symbol: string;
+  baseline_up_to_date: boolean | null;
+  missing_15m_bars: number | null;
+  last_15m_candle_time: string | null;
+};
+
 function relativeTime(value: string | null | undefined) {
   if (!value) return "n/a";
   const date = new Date(value);
@@ -74,7 +81,7 @@ export default async function AnalysisOverviewPage() {
 
   const symbols = (symbolsRes.data ?? []).map((row) => row.symbol).filter(Boolean);
 
-  const [watchRes, checksRes, signalsRes] = symbols.length > 0
+  const [watchRes, checksRes, signalsRes, gapRes] = symbols.length > 0
     ? await Promise.all([
       supabase
         .from("sync_symbol_runtime_state")
@@ -92,8 +99,12 @@ export default async function AnalysisOverviewPage() {
         .in("symbol", symbols)
         .order("created_at", { ascending: false })
         .limit(1000),
+      supabase
+        .from("v_analysis_15m_gap_status")
+        .select("symbol, baseline_up_to_date, missing_15m_bars, last_15m_candle_time")
+        .in("symbol", symbols),
     ])
-    : [{ data: [] }, { data: [] }, { data: [] }];
+    : [{ data: [] }, { data: [] }, { data: [] }, { data: [] }];
 
   const watchMap = new Map<string, WatchState>();
   for (const row of watchRes.data ?? []) {
@@ -126,13 +137,22 @@ export default async function AnalysisOverviewPage() {
     }
   }
 
+  const gapMap = new Map<string, GapStatus>();
+  if (!gapRes.error) {
+    for (const row of (gapRes.data ?? []) as GapStatus[]) {
+      gapMap.set(row.symbol, row);
+    }
+  }
+
   const rows = (symbolsRes.data ?? []).map((cfg) => {
     const symbol = cfg.symbol;
     const watch = watchMap.get(symbol) ?? null;
     const check = latestCheckMap.get(symbol) ?? null;
     const signal = latestSignalMap.get(symbol) ?? null;
+    const gap = gapMap.get(symbol) ?? null;
     const analysis = buildAnalysisStatus(check);
     const freshnessRef = check?.latest_candle_time ??
+      gap?.last_15m_candle_time ??
       watch?.last_baseline_15m_candle_time ??
       watch?.last_1m_candle_time ??
       null;
@@ -146,6 +166,8 @@ export default async function AnalysisOverviewPage() {
       watchUntil: watch?.watch_until ?? null,
       lastSignalState: signal?.signal_state ?? "none",
       lastSetupScore: asNumber(signal?.setup_score, 0),
+      baselineUpToDate: gap?.baseline_up_to_date ?? null,
+      missing15mBars: gap?.missing_15m_bars ?? null,
       freshnessRef,
     };
   });
@@ -184,7 +206,10 @@ export default async function AnalysisOverviewPage() {
                 <p className="mt-2 text-sm font-medium">{row.analysisLabel}</p>
                 <p className="text-xs text-muted-foreground">{row.analysisReason}</p>
                 <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
-                  <span>{relativeTime(row.freshnessRef)}</span>
+                  <span>
+                    {relativeTime(row.freshnessRef)}
+                    {row.missing15mBars !== null ? ` • gap ${row.missing15mBars}` : ""}
+                  </span>
                   <span>{row.lastSignalState} ({row.lastSetupScore.toFixed(1)})</span>
                 </div>
               </Link>
@@ -238,6 +263,11 @@ export default async function AnalysisOverviewPage() {
                       <span className="ml-2 text-xs text-muted-foreground">
                         ({row.lastSetupScore.toFixed(1)})
                       </span>
+                      {row.missing15mBars !== null && (
+                        <p className="text-[11px] text-muted-foreground">
+                          {row.baselineUpToDate ? "15m ok" : `gap ${row.missing15mBars}`}
+                        </p>
+                      )}
                     </TableCell>
                   </TableRow>
                 ))}
