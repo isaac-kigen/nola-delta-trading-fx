@@ -2450,6 +2450,11 @@ export async function runTradingOpportunityCheck(params: {
     maxRows: maxLtfCandles,
   });
   const latestReal1mCandle = raw1mCandles.length > 0 ? raw1mCandles[0] : null;
+  const oldestReal1mCandle = raw1mCandles.length > 0 ? raw1mCandles[raw1mCandles.length - 1] : null;
+  const ltfMinTsCandidate = oldestReal1mCandle
+    ? new Date(oldestReal1mCandle.candle_time).getTime()
+    : Number.MAX_SAFE_INTEGER;
+  const ltfMinTsMs = Number.isFinite(ltfMinTsCandidate) ? ltfMinTsCandidate : Number.MAX_SAFE_INTEGER;
   const latestMergedCandle = candlesAsc.length > 0 ? candlesAsc[candlesAsc.length - 1] : null;
 
   const latestKnownPrice = toFiniteNumber(params.latestPrice) ??
@@ -2571,6 +2576,8 @@ export async function runTradingOpportunityCheck(params: {
     asofUtc: params.latestCandleTimeUtc ?? latestCandle.candle_time,
     minRr,
     maxLtfCandles,
+    ltfMinTsMs,
+    minReal1mCandlesForLtf: Math.max(60, Math.trunc(maxReal1mBurstCandles / 3)),
     zoneBaseCandles,
     zoneImpulseCandles,
     zoneBaseMaxPips,

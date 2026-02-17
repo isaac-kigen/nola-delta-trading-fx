@@ -855,6 +855,8 @@ export function evaluatePhotonStructure(params: {
   asofUtc?: string | Date | null;
   minRr?: number;
   maxLtfCandles?: number;
+  ltfMinTsMs?: number | null;
+  minReal1mCandlesForLtf?: number;
   zoneBaseCandles?: number;
   zoneImpulseCandles?: number;
   zoneBaseMaxPips?: number;
@@ -883,6 +885,14 @@ export function evaluatePhotonStructure(params: {
     : rowsUpToAsof;
 
   const asofMs = rows1m.length > 0 ? rows1m[rows1m.length - 1].tsMs : initialAsOfMs;
+  const ltfMinTsMs = Number.isFinite(params.ltfMinTsMs)
+    ? Number(params.ltfMinTsMs)
+    : Number.NEGATIVE_INFINITY;
+  const rows1mLtf = rows1m.filter((row) => row.tsMs >= ltfMinTsMs);
+  const minReal1mCandlesForLtf = Math.max(
+    30,
+    Math.trunc(params.minReal1mCandlesForLtf ?? 180),
+  );
   const symbol = (params.symbol ?? "").trim().toUpperCase();
   const pip = symbolPipSize(symbol);
 
@@ -948,11 +958,11 @@ export function evaluatePhotonStructure(params: {
 
   const pivots4h = detectConfirmedPivots({ rows: rows4h, left: 5, right: 5, asofMs, tfMs: FOUR_HOUR_MS });
   const pivots15m = detectConfirmedPivots({ rows: rows15m, left: 3, right: 3, asofMs, tfMs: FIFTEEN_MIN_MS });
-  const pivots1m = detectConfirmedPivots({ rows: rows1m, left: 1, right: 1, asofMs, tfMs: MINUTE_MS });
+  const pivots1m = detectConfirmedPivots({ rows: rows1mLtf, left: 1, right: 1, asofMs, tfMs: MINUTE_MS });
 
   const events4h = detectStructureEvents({ rows: rows4h, pivotHighs: pivots4h.highs, pivotLows: pivots4h.lows });
   const events15m = detectStructureEvents({ rows: rows15m, pivotHighs: pivots15m.highs, pivotLows: pivots15m.lows });
-  const events1m = detectStructureEvents({ rows: rows1m, pivotHighs: pivots1m.highs, pivotLows: pivots1m.lows });
+  const events1m = detectStructureEvents({ rows: rows1mLtf, pivotHighs: pivots1m.highs, pivotLows: pivots1m.lows });
 
   const last4hBos = latestEvent(events4h.bosEvents);
   const last15mBos = latestEvent(events15m.bosEvents);
@@ -1056,7 +1066,7 @@ export function evaluatePhotonStructure(params: {
   }
 
   const desiredSide: PhotonDirection = htfTrend === "bull" ? "long" : "short";
-  const current1m = rows1m[rows1m.length - 1];
+  const current1m = rows1mLtf.length > 0 ? rows1mLtf[rows1mLtf.length - 1] : rows1m[rows1m.length - 1];
 
   const zones15m = build15mZones({
     rows15m,
@@ -1099,6 +1109,21 @@ export function evaluatePhotonStructure(params: {
     });
   }
 
+  if (rows1mLtf.length < minReal1mCandlesForLtf) {
+    return baseResult("insufficient_real_1m_ltf_history", "WAIT_SWEEP", {
+      ...commonState,
+      side: desiredSide,
+      cycle_id: cycle.id,
+      details: {
+        cycle_id: cycle.id,
+        active_zone_id: activeZone.id,
+        required_real_1m_candles_for_ltf: minReal1mCandlesForLtf,
+        available_real_1m_candles_for_ltf: rows1mLtf.length,
+        ltf_min_ts_utc: Number.isFinite(ltfMinTsMs) ? new Date(ltfMinTsMs).toISOString() : null,
+      },
+    });
+  }
+
   const pools1mHigh = buildLiquidityPools({
     pivots: pivots1m.highs,
     kind: "EQH",
@@ -1113,7 +1138,7 @@ export function evaluatePhotonStructure(params: {
   });
 
   const sweeps = detectSweeps({
-    rows1m,
+    rows1m: rows1mLtf,
     pools: [...pools1mHigh, ...pools1mLow],
     epsPrice,
     minTsMs: cycle.end.tsMs,
@@ -1126,7 +1151,7 @@ export function evaluatePhotonStructure(params: {
       event.tsMs > cycle.end.tsMs
     )
     .filter((event) => {
-      const row = rows1m.find((candle) => candle.tsMs === event.tsMs);
+      const row = rows1mLtf.find((candle) => candle.tsMs === event.tsMs);
       if (!row) return false;
       return row.high >= activeZone.zone_low && row.low <= activeZone.zone_high;
     })
@@ -1152,7 +1177,9 @@ export function evaluatePhotonStructure(params: {
     });
   }
 
-  const mitigationTouch = rows1m.find((row) => row.tsMs > sweep.tsMs && row.low <= activeZone.zone_mid && row.high >= activeZone.zone_mid) ?? null;
+  const mitigationTouch = rows1mLtf.find((row) =>
+    row.tsMs > sweep.tsMs && row.low <= activeZone.zone_mid && row.high >= activeZone.zone_mid
+  ) ?? null;
   if (!mitigationTouch) {
     return baseResult("zone_midpoint_not_mitigated_after_sweep", "WAIT_MITIGATION", {
       ...commonState,
@@ -1188,7 +1215,7 @@ export function evaluatePhotonStructure(params: {
     });
   }
 
-  const entryCandle = rows1m[choch.index + 1] ?? null;
+  const entryCandle = rows1mLtf[choch.index + 1] ?? null;
   if (!entryCandle) {
     return baseResult("entry_candle_not_available", "WAIT_CHOCH", {
       ...commonState,
@@ -1361,6 +1388,8 @@ export function evaluatePhotonStructure(params: {
         m1_highs: pivots1m.highs.length,
         m1_lows: pivots1m.lows.length,
       },
+      ltf_real_1m_rows_used: rows1mLtf.length,
+      ltf_min_ts_utc: Number.isFinite(ltfMinTsMs) ? new Date(ltfMinTsMs).toISOString() : null,
       zones_built: zones15m.length,
       pools_1m_eqh: pools1mHigh.length,
       pools_1m_eql: pools1mLow.length,

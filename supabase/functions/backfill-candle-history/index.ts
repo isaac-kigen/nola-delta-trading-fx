@@ -1,5 +1,5 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { upsertMinuteCandles } from "../_shared/candleStore.ts";
+import { upsertFifteenMinuteCandles, upsertMinuteCandles } from "../_shared/candleStore.ts";
 import { enforceSecretAuth } from "../_shared/auth.ts";
 import { readSymbol, requiredEnv } from "../_shared/config.ts";
 import { corsHeaders, jsonResponse } from "../_shared/http.ts";
@@ -33,10 +33,157 @@ interface BackfillRequest {
   smart_lookback_days?: number | string;
 }
 
+interface ProviderCandleRow {
+  datetime: string;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume?: string | null;
+}
+
 const MINUTE_MS = 60_000;
 const DAY_MS = 24 * 60 * MINUTE_MS;
 const MAX_SAFE_CHUNK_DAYS_FINNHUB = 30;
 const MAX_SAFE_CHUNK_DAYS_TWELVE = 3;
+
+function formatUtcDateTime(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+}
+
+function parseCandleUtcMs(datetime: string): number | null {
+  const raw = String(datetime ?? "").trim();
+  if (!raw) return null;
+  const hasOffset = /[+-]\d{2}:\d{2}$/.test(raw);
+  const hasZulu = /z$/i.test(raw);
+  const normalized = raw.includes("T")
+    ? (hasZulu || hasOffset ? raw : `${raw}Z`)
+    : `${raw.replace(" ", "T")}Z`;
+  const tsMs = new Date(normalized).getTime();
+  return Number.isFinite(tsMs) ? tsMs : null;
+}
+
+interface ParsedMinuteCandle {
+  tsMs: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number | null;
+}
+
+interface FifteenMinuteBucketState {
+  bucketStartMs: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number | null;
+  minuteCount: number;
+}
+
+function parseMinuteCandles(candles: ProviderCandleRow[]): ParsedMinuteCandle[] {
+  const deduped = new Map<number, ParsedMinuteCandle>();
+  for (const row of candles) {
+    const tsMs = parseCandleUtcMs(row.datetime);
+    if (!Number.isFinite(tsMs)) continue;
+
+    const open = Number.parseFloat(row.open);
+    const high = Number.parseFloat(row.high);
+    const low = Number.parseFloat(row.low);
+    const close = Number.parseFloat(row.close);
+    const volume = row.volume === undefined || row.volume === null || row.volume === ""
+      ? null
+      : Number.parseFloat(String(row.volume));
+
+    if (![open, high, low, close].every(Number.isFinite)) continue;
+
+    deduped.set(tsMs as number, {
+      tsMs: tsMs as number,
+      open,
+      high,
+      low,
+      close,
+      volume: Number.isFinite(volume) ? volume : null,
+    });
+  }
+
+  return [...deduped.values()].sort((a, b) => a.tsMs - b.tsMs);
+}
+
+function build15mCandleFromBucket(bucket: FifteenMinuteBucketState): ProviderCandleRow {
+  return {
+    datetime: formatUtcDateTime(new Date(bucket.bucketStartMs)),
+    open: bucket.open.toString(),
+    high: bucket.high.toString(),
+    low: bucket.low.toString(),
+    close: bucket.close.toString(),
+    volume: bucket.volume === null ? null : bucket.volume.toString(),
+  };
+}
+
+function aggregateMinuteCandlesTo15m(params: {
+  candles: ProviderCandleRow[];
+  carry: FifteenMinuteBucketState | null;
+}): { candles15m: ProviderCandleRow[]; carry: FifteenMinuteBucketState | null } {
+  const rows = parseMinuteCandles(params.candles);
+  if (rows.length === 0) {
+    return { candles15m: [], carry: params.carry };
+  }
+
+  const output: ProviderCandleRow[] = [];
+  let carry = params.carry;
+
+  for (const row of rows) {
+    const bucketStartMs = Math.floor(row.tsMs / (15 * MINUTE_MS)) * (15 * MINUTE_MS);
+    if (!carry) {
+      carry = {
+        bucketStartMs,
+        open: row.open,
+        high: row.high,
+        low: row.low,
+        close: row.close,
+        volume: row.volume,
+        minuteCount: 1,
+      };
+      continue;
+    }
+
+    if (carry.bucketStartMs === bucketStartMs) {
+      carry.high = Math.max(carry.high, row.high);
+      carry.low = Math.min(carry.low, row.low);
+      carry.close = row.close;
+      carry.minuteCount += 1;
+      if (row.volume !== null) {
+        carry.volume = carry.volume === null ? row.volume : carry.volume + row.volume;
+      }
+      continue;
+    }
+
+    // Only persist complete 15m buckets; avoid writing partial OHLC at chunk boundaries.
+    if (carry.minuteCount >= 15) {
+      output.push(build15mCandleFromBucket(carry));
+    }
+
+    carry = {
+      bucketStartMs,
+      open: row.open,
+      high: row.high,
+      low: row.low,
+      close: row.close,
+      volume: row.volume,
+      minuteCount: 1,
+    };
+  }
+
+  return { candles15m: output, carry };
+}
+
+function flush15mCarry(carry: FifteenMinuteBucketState | null): ProviderCandleRow[] {
+  if (!carry || carry.minuteCount < 15) return [];
+  return [build15mCandleFromBucket(carry)];
+}
 
 type MarketProvider = "finnhub" | "twelve_data";
 
@@ -235,6 +382,8 @@ serve(async (req) => {
     chunks_completed: 0,
     fetched_rows: 0,
     saved_rows: 0,
+    fetched_rows_15m: 0,
+    saved_rows_15m: 0,
     api_calls_used: 0,
     empty_chunks_skipped: 0,
   };
@@ -300,7 +449,6 @@ serve(async (req) => {
     });
 
     const lockEnabled = parseBoolean(Deno.env.get("LOCK_ENABLED"), true);
-    const lockFailOpen = parseBoolean(Deno.env.get("LOCK_FAIL_OPEN"), true);
     if (lockEnabled) {
       lockName = `backfill-candle-history:${symbol}`;
       const lockTtlSeconds = parseInteger(Deno.env.get("BACKFILL_LOCK_TTL_SECONDS"), 7200);
@@ -314,7 +462,7 @@ serve(async (req) => {
       const lockRow = lockData as Record<string, unknown> | null;
 
       if (lockError) {
-        const canFailOpen = lockFailOpen || isMissingLockRpcError(lockError.message);
+        const canFailOpen = isMissingLockRpcError(lockError.message);
         if (canFailOpen) {
           lockName = null;
           await insertOpsAlert({
@@ -326,7 +474,7 @@ serve(async (req) => {
             payload: {
               rpc_error: lockError.message,
               symbol,
-              lock_fail_open: lockFailOpen,
+              lock_fail_open: false,
             },
           });
         } else {
@@ -334,7 +482,12 @@ serve(async (req) => {
         }
       }
 
-      const lockAcquired = lockError ? true : Boolean(lockRow?.acquired);
+      const lockOwnerTraceId = lockRow?.owner_trace_id === null || lockRow?.owner_trace_id === undefined
+        ? null
+        : String(lockRow.owner_trace_id);
+      const lockAcquired = lockError
+        ? true
+        : Boolean(lockRow?.acquired) || lockOwnerTraceId === traceId;
       if (!lockAcquired) {
         runStatus = "partial";
         runPayload = {
@@ -461,8 +614,24 @@ serve(async (req) => {
       );
     }
 
-    const totalMinutesRequested = Math.floor((requestedEnd.getTime() - requestedStart.getTime()) / MINUTE_MS) + 1;
-    const estimatedChunks = Math.ceil(totalMinutesRequested / (chunkDays * 24 * 60));
+    let totalMinutesRequested = Math.floor((requestedEnd.getTime() - requestedStart.getTime()) / MINUTE_MS) + 1;
+    let estimatedChunks = Math.ceil(totalMinutesRequested / (chunkDays * 24 * 60));
+
+    if (
+      estimatedChunks > maxChunksPerRun &&
+      smartMode &&
+      !startDateInput &&
+      !endDateInput
+    ) {
+      const maxMinutesPerRun = maxChunksPerRun * chunkDays * 24 * 60;
+      requestedStart = new Date(requestedEnd.getTime() - (maxMinutesPerRun - 1) * MINUTE_MS);
+      requestedStart = floorToMinuteUtc(requestedStart);
+      totalMinutesRequested = Math.floor((requestedEnd.getTime() - requestedStart.getTime()) / MINUTE_MS) + 1;
+      estimatedChunks = Math.ceil(totalMinutesRequested / (chunkDays * 24 * 60));
+      if (!smartModeFallbackReason) {
+        smartModeFallbackReason = "smart_range_clamped_to_max_chunks_per_run";
+      }
+    }
 
     if (estimatedChunks > maxChunksPerRun) {
       runStatus = "partial";
@@ -490,6 +659,7 @@ serve(async (req) => {
     const chunkMs = chunkDays * DAY_MS;
     let cursor = requestedStart.getTime();
     const hardEndMs = requestedEnd.getTime();
+    let carry15m: FifteenMinuteBucketState | null = null;
     while (cursor <= hardEndMs) {
       const chunkStart = new Date(cursor);
       const chunkEnd = new Date(Math.min(hardEndMs, cursor + chunkMs - MINUTE_MS));
@@ -505,7 +675,7 @@ serve(async (req) => {
       });
       progress.api_calls_used += 1;
 
-      let candles: Awaited<ReturnType<typeof fetchTwelveCandlesWithRetry>> = [];
+      let candles: ProviderCandleRow[] = [];
       try {
         candles = dataProvider === "twelve_data"
           ? await fetchTwelveCandlesWithRetry({
@@ -545,15 +715,37 @@ serve(async (req) => {
         continue;
       }
 
+      const aggregated15m = aggregateMinuteCandlesTo15m({
+        candles,
+        carry: carry15m,
+      });
+      const candles15m = aggregated15m.candles15m;
+      carry15m = aggregated15m.carry;
+      progress.fetched_rows_15m += candles15m.length;
+
       if (!dryRun && candles.length > 0) {
         const changed = await upsertMinuteCandles(supabase, symbol, candles, 2_000, dataProvider);
         progress.saved_rows += changed;
+        if (candles15m.length > 0) {
+          const changed15m = await upsertFifteenMinuteCandles(supabase, symbol, candles15m, 500, dataProvider);
+          progress.saved_rows_15m += changed15m;
+        }
       } else if (dryRun) {
         progress.saved_rows += candles.length;
+        progress.saved_rows_15m += candles15m.length;
       }
 
       progress.chunks_completed += 1;
       cursor = chunkEnd.getTime() + MINUTE_MS;
+    }
+
+    const trailing15m = flush15mCarry(carry15m);
+    progress.fetched_rows_15m += trailing15m.length;
+    if (!dryRun && trailing15m.length > 0) {
+      const changed15m = await upsertFifteenMinuteCandles(supabase, symbol, trailing15m, 500, dataProvider);
+      progress.saved_rows_15m += changed15m;
+    } else if (dryRun) {
+      progress.saved_rows_15m += trailing15m.length;
     }
 
     const responsePayload = {
@@ -584,6 +776,8 @@ serve(async (req) => {
       chunks_completed: progress.chunks_completed,
       fetched_rows: progress.fetched_rows,
       saved_rows: progress.saved_rows,
+      fetched_rows_15m: progress.fetched_rows_15m,
+      saved_rows_15m: progress.saved_rows_15m,
       api_calls_used: progress.api_calls_used,
       empty_chunks_skipped: progress.empty_chunks_skipped,
     };

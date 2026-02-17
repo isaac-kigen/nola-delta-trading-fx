@@ -15,6 +15,9 @@ interface StrategyMeta {
   strategy_version: string;
   setup_label: string;
   signal_ttl_hours: number;
+  session_start_hour_utc: number;
+  session_end_hour_utc: number;
+  session_filter_enabled: boolean;
   liquidity_eps_pips: number;
   zone_base_candles: number;
   zone_base_max_pips: number;
@@ -131,6 +134,58 @@ function pipSize(symbol: string): number {
   return symbol.includes("JPY") ? 0.01 : 0.0001;
 }
 
+function isWithinSession(hourUtc: number, startHour: number, endHour: number): boolean {
+  if (startHour === endHour) return true;
+  if (startHour < endHour) {
+    return hourUtc >= startHour && hourUtc < endHour;
+  }
+  return hourUtc >= startHour || hourUtc < endHour;
+}
+
+function expand15mToSynthetic1m(rows15mAsc: Candle1m[]): Candle1m[] {
+  const out: Candle1m[] = [];
+  for (const row of rows15mAsc) {
+    const startMs = new Date(row.candle_time).getTime();
+    if (!Number.isFinite(startMs)) continue;
+    for (let i = 0; i < 15; i += 1) {
+      const ts = new Date(startMs + i * MINUTE_MS).toISOString();
+      out.push({
+        candle_time: ts,
+        open: row.open,
+        high: row.high,
+        low: row.low,
+        close: row.close,
+      });
+    }
+  }
+  return out;
+}
+
+function mergeSyntheticAndReal1m(params: {
+  syntheticAsc: Candle1m[];
+  realAsc: Candle1m[];
+  maxRows: number;
+}): Candle1m[] {
+  const byTs = new Map<number, Candle1m>();
+
+  for (const row of params.syntheticAsc) {
+    const ts = new Date(row.candle_time).getTime();
+    if (!Number.isFinite(ts)) continue;
+    byTs.set(ts, row);
+  }
+  for (const row of params.realAsc) {
+    const ts = new Date(row.candle_time).getTime();
+    if (!Number.isFinite(ts)) continue;
+    byTs.set(ts, row);
+  }
+
+  const asc = [...byTs.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map((entry) => entry[1]);
+  if (asc.length <= params.maxRows) return asc;
+  return asc.slice(asc.length - params.maxRows);
+}
+
 function setupScoreFromRr(rr: number | null): number {
   if (rr === null || !Number.isFinite(rr)) return 0;
   return round(clamp(60 + rr * 20, 0, 100), 2);
@@ -144,6 +199,9 @@ async function loadStrategyMeta(
     strategy_version: "v3.1.0-photon-zones",
     setup_label: "setup_score",
     signal_ttl_hours: 6,
+    session_start_hour_utc: 6,
+    session_end_hour_utc: 22,
+    session_filter_enabled: true,
     liquidity_eps_pips: symbol.includes("JPY") ? 0.2 : 2.0,
     zone_base_candles: 3,
     zone_base_max_pips: 12,
@@ -163,7 +221,7 @@ async function loadStrategyMeta(
   const { data: symbolData } = await supabase
     .from("strategy_symbol_config")
     .select(
-      "strategy_version,signal_ttl_hours,enabled,liquidity_eps_pips,zone_base_candles,zone_base_max_pips,zone_impulse_candles,zone_impulse_pips,zone_invalidation_pips,one_trade_per_cycle",
+      "strategy_version,signal_ttl_hours,enabled,session_start_hour_utc,session_end_hour_utc,liquidity_eps_pips,zone_base_candles,zone_base_max_pips,zone_impulse_candles,zone_impulse_pips,zone_invalidation_pips,one_trade_per_cycle",
     )
     .eq("symbol", symbol)
     .maybeSingle();
@@ -186,6 +244,30 @@ async function loadStrategyMeta(
         toFiniteNumber(symbolValue.signal_ttl_hours) ??
           defaultMeta.signal_ttl_hours,
       ),
+    ),
+    session_start_hour_utc: Math.max(
+      0,
+      Math.min(
+        23,
+        Math.trunc(
+          toFiniteNumber(symbolValue.session_start_hour_utc) ??
+            defaultMeta.session_start_hour_utc,
+        ),
+      ),
+    ),
+    session_end_hour_utc: Math.max(
+      0,
+      Math.min(
+        23,
+        Math.trunc(
+          toFiniteNumber(symbolValue.session_end_hour_utc) ??
+            defaultMeta.session_end_hour_utc,
+        ),
+      ),
+    ),
+    session_filter_enabled: toBoolean(
+      globalValue.session_filter_enabled,
+      defaultMeta.session_filter_enabled,
     ),
     liquidity_eps_pips: Math.max(
       0.01,
@@ -460,6 +542,7 @@ export async function runStrategyValidation(params: {
   const maxCandlesRequested = Math.max(5_000, Math.trunc(toFiniteNumber(params.maxCandles) ?? 50_000));
   const maxCandlesCap = Math.max(5_000, Math.trunc(toFiniteNumber(Deno.env.get("PHOTON_VALIDATION_MAX_CANDLES")) ?? 20_000));
   const maxCandles = Math.min(maxCandlesRequested, maxCandlesCap);
+  const max15mCandles = Math.max(500, Math.ceil(maxCandles / 15) + 500);
   const validationPageSize = Math.max(
     200,
     Math.min(5_000, Math.trunc(toFiniteNumber(Deno.env.get("VALIDATION_PAGE_SIZE")) ?? 1_000)),
@@ -479,8 +562,11 @@ export async function runStrategyValidation(params: {
 
   const paddedFrom = new Date(fromTime.getTime() - 10 * 24 * HOUR_MS);
   const rawCandles: Array<Record<string, unknown>> = [];
+  const raw15mCandles: Array<Record<string, unknown>> = [];
   let offset = 0;
+  let offset15m = 0;
   let candlePagesFetched = 0;
+  let candles15mPagesFetched = 0;
 
   while (rawCandles.length < maxCandles) {
     const remaining = maxCandles - rawCandles.length;
@@ -510,6 +596,34 @@ export async function runStrategyValidation(params: {
     if (rows.length < pageSize) break;
   }
 
+  while (raw15mCandles.length < max15mCandles) {
+    const remaining = max15mCandles - raw15mCandles.length;
+    const pageSize = Math.min(validationPageSize, remaining);
+    const pageFrom = offset15m;
+    const pageTo = offset15m + pageSize - 1;
+
+    const { data: pageRows, error: candleError } = await params.supabase
+      .from("price_candles_15m")
+      .select("candle_time, open, high, low, close")
+      .eq("symbol", normalizedSymbol)
+      .gte("candle_time", paddedFrom.toISOString())
+      .lte("candle_time", toTime.toISOString())
+      .order("candle_time", { ascending: true })
+      .range(pageFrom, pageTo);
+
+    if (candleError) {
+      throw new Error(`Failed reading 15m candles for validation: ${candleError.message}`);
+    }
+
+    const rows = pageRows ?? [];
+    if (rows.length === 0) break;
+
+    candles15mPagesFetched += 1;
+    raw15mCandles.push(...rows);
+    offset15m += rows.length;
+    if (rows.length < pageSize) break;
+  }
+
   const candlesAll: Candle1m[] = rawCandles
     .map((row) => ({
       candle_time: String(row.candle_time),
@@ -529,19 +643,57 @@ export async function runStrategyValidation(params: {
       const ts = new Date(row.candle_time).getTime();
       return ts >= fromTime.getTime() && ts <= toTime.getTime();
     });
+  const candles15mAll: Candle1m[] = raw15mCandles
+    .map((row) => ({
+      candle_time: String(row.candle_time),
+      open: Number(row.open),
+      high: Number(row.high),
+      low: Number(row.low),
+      close: Number(row.close),
+    }))
+    .filter((row) =>
+      Number.isFinite(new Date(row.candle_time).getTime()) &&
+      Number.isFinite(row.open) &&
+      Number.isFinite(row.high) &&
+      Number.isFinite(row.low) &&
+      Number.isFinite(row.close)
+    )
+    .filter((row) => {
+      const ts = new Date(row.candle_time).getTime();
+      return ts >= paddedFrom.getTime() && ts <= toTime.getTime();
+    });
 
   if (candlesAll.length < 2_500) {
     throw new Error(
       `Insufficient 1m candles for validation (${candlesAll.length}). Need at least 2500.`,
     );
   }
+  if (candles15mAll.length < 200) {
+    throw new Error(
+      `Insufficient 15m candles for validation (${candles15mAll.length}). Need at least 200.`,
+    );
+  }
 
   const candles = candlesAll.slice(Math.max(0, candlesAll.length - maxCandles));
+  const candles15m = candles15mAll.slice(Math.max(0, candles15mAll.length - max15mCandles));
   const indexMap = indexByTime(candles);
   const ttlBars = Math.max(30, meta.signal_ttl_hours * 60);
+  const requireReal1mTrigger = toBoolean(
+    Deno.env.get("PHOTON_REQUIRE_REAL_1M_TRIGGER"),
+    true,
+  );
+  const real1mBurstLimit = Math.max(
+    60,
+    Math.trunc(toFiniteNumber(Deno.env.get("STRUCTURE_REAL_1M_BURST_LIMIT")) ?? 600),
+  );
+  const real1mFreshnessMinutes = Math.max(
+    1,
+    Math.trunc(toFiniteNumber(Deno.env.get("PHOTON_REAL_1M_FRESHNESS_MINUTES")) ?? 20),
+  );
 
   const evaluationStride = Math.max(1, Math.trunc(candles.length / 400));
   const windowSize = Math.max(2_500, Math.min(6_000, candles.length));
+  const windowSize15m = Math.max(240, Math.ceil(windowSize / 15) + 200);
   const warmupBars = 2_000;
 
   const simulated: SimulatedSignal[] = [];
@@ -553,16 +705,57 @@ export async function runStrategyValidation(params: {
 
   for (let i = warmupBars; i < candles.length - 1; i += evaluationStride) {
     const asofCandle = candles[i];
+    const asofMs = new Date(asofCandle.candle_time).getTime();
+    if (!Number.isFinite(asofMs)) {
+      signalsSkippedByControls += 1;
+      continue;
+    }
+
+    if (
+      meta.session_filter_enabled &&
+      !isWithinSession(
+        new Date(asofMs).getUTCHours(),
+        meta.session_start_hour_utc,
+        meta.session_end_hour_utc,
+      )
+    ) {
+      signalsSkippedByControls += 1;
+      continue;
+    }
+
     const windowStart = Math.max(0, i - windowSize);
-    const windowCandles = candles.slice(windowStart, i + 1);
+    const windowRealCandles = candles.slice(windowStart, i + 1);
+    const window15mCandles = candles15m
+      .filter((row) => {
+        const tsMs = new Date(row.candle_time).getTime();
+        return Number.isFinite(tsMs) && tsMs <= asofMs;
+      })
+      .slice(-windowSize15m);
+    const synthetic1m = expand15mToSynthetic1m(window15mCandles);
+    const mergedCandles = mergeSyntheticAndReal1m({
+      syntheticAsc: synthetic1m,
+      realAsc: windowRealCandles,
+      maxRows: windowSize,
+    });
+    const oldestReal1mTs = windowRealCandles.length > 0
+      ? new Date(windowRealCandles[0].candle_time).getTime()
+      : Number.MAX_SAFE_INTEGER;
+    const latestReal1mTs = windowRealCandles.length > 0
+      ? new Date(windowRealCandles[windowRealCandles.length - 1].candle_time).getTime()
+      : Number.NEGATIVE_INFINITY;
+    const latestReal1mAgeMinutes = Number.isFinite(latestReal1mTs)
+      ? Math.max(0, (asofMs - latestReal1mTs) / MINUTE_MS)
+      : Number.POSITIVE_INFINITY;
 
     signalsEvaluated += 1;
     const evalResult = evaluatePhotonStructure({
-      candles1m: windowCandles,
+      candles1m: mergedCandles,
       symbol: normalizedSymbol,
       asofUtc: asofCandle.candle_time,
       minRr,
       maxLtfCandles: windowSize,
+      ltfMinTsMs: Number.isFinite(oldestReal1mTs) ? oldestReal1mTs : Number.MAX_SAFE_INTEGER,
+      minReal1mCandlesForLtf: Math.max(60, Math.trunc(real1mBurstLimit / 3)),
       zoneBaseCandles: meta.zone_base_candles,
       zoneImpulseCandles: meta.zone_impulse_candles,
       zoneBaseMaxPips: meta.zone_base_max_pips,
@@ -570,6 +763,14 @@ export async function runStrategyValidation(params: {
       zoneInvalidationPips: meta.zone_invalidation_pips,
       liquidityEpsPips: meta.liquidity_eps_pips,
     });
+
+    if (
+      requireReal1mTrigger &&
+      (!Number.isFinite(latestReal1mAgeMinutes) || latestReal1mAgeMinutes > real1mFreshnessMinutes)
+    ) {
+      signalsSkippedByControls += 1;
+      continue;
+    }
 
     if (!evalResult.valid || evalResult.side === "none") {
       signalsSkippedByControls += 1;
@@ -670,6 +871,12 @@ export async function runStrategyValidation(params: {
       htf_pivot: "5-5",
       mtf_pivot: "3-3",
       ltf_pivot: "1-1",
+      data_source: "price_candles_15m + price_candles_1m",
+      ltf_real_1m_required: requireReal1mTrigger,
+      real_1m_burst_limit: real1mBurstLimit,
+      real_1m_freshness_minutes: real1mFreshnessMinutes,
+      session_filter_enabled: meta.session_filter_enabled,
+      session_hours_utc: [meta.session_start_hour_utc, meta.session_end_hour_utc],
       bos_validation: "close_break",
       choch_validation: "wick_break",
       entry_policy: "next_1m_open",
@@ -694,7 +901,9 @@ export async function runStrategyValidation(params: {
       max_candles_effective: maxCandles,
       validation_page_size: validationPageSize,
       candle_pages_fetched: candlePagesFetched,
+      candles_15m_pages_fetched: candles15mPagesFetched,
       raw_candles_before_filter: rawCandles.length,
+      raw_15m_candles_before_filter: raw15mCandles.length,
       pip_size: pipSize(normalizedSymbol),
     },
   };

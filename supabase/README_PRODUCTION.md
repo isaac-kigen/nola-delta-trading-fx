@@ -11,6 +11,7 @@ This run includes:
 - `202602140001_finnhub_structure_pipeline.sql` (Finnhub + 1m storage + provider rate limits)
 - `202602150001_photon_zones_liquidity_cycle.sql` (strict 15M zone/sweep gates + one-trade-per-cycle)
 - `202602150002_cycle_atomic_trigger_lock.sql` (atomic one-trade-per-cycle trigger lock)
+- `202602170001_fix_analysis_gap_market_hours.sql` (FX-market-hours-aware 15m gap math)
 
 `202602130005_broker_position_tracking.sql` adds:
 - `trading_positions.broker_position_id`
@@ -38,7 +39,11 @@ Minimum production requirements:
 
 Recommended Photon strategy tuning (if not set in DB/runtime config):
 - `STRUCTURE_MAX_1M_CANDLES` (default `12000`)
+- `STRUCTURE_MAX_15M_CANDLES` (default derived from 1m window)
+- `STRUCTURE_REAL_1M_BURST_LIMIT` (default `600`)
 - `STRUCTURE_FETCH_PAGE_SIZE` (default `1000`)
+- `PHOTON_REQUIRE_REAL_1M_TRIGGER` (default `true`)
+- `PHOTON_REAL_1M_FRESHNESS_MINUTES` (default `20`)
 - `PHOTON_MIN_RR` (default `2.0`)
 - `PHOTON_ZONE_BASE_CANDLES` (default `3`)
 - `PHOTON_ZONE_BASE_MAX_PIPS` (default `12`)
@@ -52,6 +57,7 @@ Recommended Photon strategy tuning (if not set in DB/runtime config):
 Recommended hardening flags:
 - `REQUIRE_INTERNAL_AUTH=true`
 - `REQUIRE_CALLBACK_AUTH=true`
+- `LOCK_FAIL_OPEN=false`
 - `CTRADER_OAUTH_ENFORCE_STATE=true`
 - `CTRADER_OAUTH_ALLOW_LEGACY_STATE=false`
 - `BROKER_CIRCUIT_BREAKER_ENABLED=true`
@@ -84,6 +90,7 @@ Use `supabase/cron/setup_broker_jobs.sql` and replace placeholders:
 Recommended:
 - Keep quick sync (`only_open=true`) every 5 minutes.
 - Add full reconciliation (`only_open=false`) hourly to recover from missed callbacks.
+- `sync-latest-candle` should run every minute: it now does 15m baseline/catch-up continuously, and only does 1m polling during watch bursts.
 
 ## 5) cTrader OAuth
 

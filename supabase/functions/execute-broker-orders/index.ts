@@ -818,7 +818,7 @@ serve(async (req) => {
     120_000,
   );
   const lockEnabled = parseBoolean(Deno.env.get("LOCK_ENABLED"), true);
-  const lockFailOpen = parseBoolean(Deno.env.get("LOCK_FAIL_OPEN"), true);
+  const lockFailOpen = parseBoolean(Deno.env.get("LOCK_FAIL_OPEN"), false);
   const lockTtlSeconds = parseInteger(
     Deno.env.get("BROKER_EXECUTION_LOCK_TTL_SECONDS"),
     55,
@@ -1167,7 +1167,12 @@ serve(async (req) => {
         }
       }
 
-      const lockAcquired = lockError ? true : Boolean(lockRow?.acquired);
+      const lockOwnerTraceId = lockRow?.owner_trace_id === null || lockRow?.owner_trace_id === undefined
+        ? null
+        : String(lockRow.owner_trace_id);
+      const lockAcquired = lockError
+        ? true
+        : Boolean(lockRow?.acquired) || lockOwnerTraceId === traceId;
       if (!lockAcquired) {
         runStatus = "partial";
         runPayload = {

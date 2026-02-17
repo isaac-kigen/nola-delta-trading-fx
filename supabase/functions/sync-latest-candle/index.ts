@@ -28,6 +28,7 @@ import {
   markOpportunityTelegramNotified,
   reserveTelegramNotification,
   runTradingOpportunityCheck,
+  type TradingOpportunityResult,
 } from "../_shared/tradingOpportunity.ts";
 
 type MarketProvider = "finnhub" | "twelve_data";
@@ -67,7 +68,8 @@ interface BaselineSetupResult {
   direction: "long" | "short" | "none";
   setupScore: number;
   reason: string;
-  atrPips: number;
+  strategyState: string;
+  strategyReason: string;
 }
 
 const MINUTE_MS = 60 * 1000;
@@ -182,123 +184,78 @@ function isWithinSession(nowUtc: Date, sessionStartHourUtc: number, sessionEndHo
   return hour >= sessionStartHourUtc || hour < sessionEndHourUtc;
 }
 
-function pipSize(symbol: string): number {
-  return symbol.includes("JPY") ? 0.01 : 0.0001;
+function parseNumeric(value: unknown): number | null {
+  const n = typeof value === "string" ? Number.parseFloat(value) : Number(value);
+  return Number.isFinite(n) ? n : null;
 }
 
-function ema(values: number[], period: number): Array<number | null> {
-  if (values.length === 0) return [];
-  const k = 2 / (period + 1);
-  const out: Array<number | null> = new Array(values.length).fill(null);
-
-  let seed = 0;
-  for (let i = 0; i < values.length; i += 1) {
-    if (i < period) {
-      seed += values[i];
-      if (i === period - 1) out[i] = seed / period;
-      continue;
-    }
-
-    const prev = out[i - 1] ?? values[i - 1];
-    out[i] = values[i] * k + prev * (1 - k);
+function parseDirection(value: unknown): "long" | "short" | "none" {
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "long" || normalized === "short") return normalized;
   }
-  return out;
+  return "none";
 }
 
-function atr(highs: number[], lows: number[], closes: number[], period = 14): Array<number | null> {
-  const tr: number[] = [];
-  for (let i = 0; i < highs.length; i += 1) {
-    if (i === 0) {
-      tr.push(highs[i] - lows[i]);
-      continue;
-    }
-    const hL = highs[i] - lows[i];
-    const hPc = Math.abs(highs[i] - closes[i - 1]);
-    const lPc = Math.abs(lows[i] - closes[i - 1]);
-    tr.push(Math.max(hL, hPc, lPc));
-  }
+function parsePhotonDirectionFromCheck(check: TradingOpportunityResult): "long" | "short" | "none" {
+  const direct = parseDirection(check.direction);
+  if (direct !== "none") return direct;
 
-  const output: Array<number | null> = new Array(tr.length).fill(null);
-  if (tr.length <= period) return output;
-
-  let seed = 0;
-  for (let i = 1; i <= period; i += 1) {
-    seed += tr[i];
-  }
-  let prevAtr = seed / period;
-  output[period] = prevAtr;
-
-  for (let i = period + 1; i < tr.length; i += 1) {
-    prevAtr = (prevAtr * (period - 1) + tr[i]) / period;
-    output[i] = prevAtr;
-  }
-
-  return output;
+  const details = (check.details ?? {}) as Record<string, unknown>;
+  const photon = (details.photon ?? {}) as Record<string, unknown>;
+  return parseDirection(photon.side);
 }
 
-function evaluate15mSetup(symbol: string, rowsAsc: CandleRow[]): BaselineSetupResult {
-  if (rowsAsc.length < 60) {
+function baselineScoreFromState(state: string): number {
+  switch (state) {
+    case "READY":
+      return 95;
+    case "WAIT_CHOCH":
+      return 85;
+    case "WAIT_MITIGATION":
+      return 75;
+    case "WAIT_SWEEP":
+      return 68;
+    case "WAIT_ZONE":
+      return 55;
+    case "WAIT_PULLBACK_END":
+      return 35;
+    case "WAIT_HTF":
+      return 15;
+    default:
+      return 0;
+  }
+}
+
+function evaluateBaselineSetupFromCheck(check: TradingOpportunityResult | null): BaselineSetupResult {
+  if (!check) {
     return {
       candidate: false,
       direction: "none",
       setupScore: 0,
-      reason: "insufficient_15m_history",
-      atrPips: 0,
+      reason: "baseline_check_unavailable",
+      strategyState: "WAIT_HTF",
+      strategyReason: "baseline_check_unavailable",
     };
   }
 
-  const closes = rowsAsc.map((row) => Number.parseFloat(row.close));
-  const highs = rowsAsc.map((row) => Number.parseFloat(row.high));
-  const lows = rowsAsc.map((row) => Number.parseFloat(row.low));
-
-  const ema20 = ema(closes, 20);
-  const ema50 = ema(closes, 50);
-  const atr14 = atr(highs, lows, closes, 14);
-
-  const index = closes.length - 1;
-  const close = closes[index];
-  const e20 = ema20[index];
-  const e50 = ema50[index];
-  const a14 = atr14[index];
-
-  if (!Number.isFinite(close) || e20 === null || e50 === null || a14 === null || a14 <= 0) {
-    return {
-      candidate: false,
-      direction: "none",
-      setupScore: 0,
-      reason: "indicators_unavailable",
-      atrPips: 0,
-    };
-  }
-
-  const pips = pipSize(symbol);
-  const atrPips = a14 / pips;
-  const distanceToEma20 = Math.abs(close - e20);
-  const pullbackReady = distanceToEma20 <= (0.35 * a14);
-  const longTrend = close > e20 && e20 > e50;
-  const shortTrend = close < e20 && e20 < e50;
-  const volOk = atrPips >= 4 && atrPips <= 90;
-
-  const direction: "long" | "short" | "none" = longTrend ? "long" : shortTrend ? "short" : "none";
-  const candidate = direction !== "none" && pullbackReady && volOk;
-
-  let score = 0;
-  if (direction !== "none") score += 45;
-  if (pullbackReady) score += 35;
-  if (volOk) score += 20;
+  const direction = parsePhotonDirectionFromCheck(check);
+  const state = String(check.strategy_state ?? "WAIT_HTF");
+  const strategyReason = String(check.strategy_reason ?? "unknown");
+  const candidateStates = new Set(["WAIT_SWEEP", "WAIT_MITIGATION", "WAIT_CHOCH", "READY"]);
+  const candidate = direction !== "none" && candidateStates.has(state);
+  const setupScoreRaw = parseNumeric(check.setup_score);
+  const setupScore = setupScoreRaw === null || (candidate && setupScoreRaw <= 0)
+    ? baselineScoreFromState(state)
+    : setupScoreRaw;
 
   return {
     candidate,
     direction,
-    setupScore: Math.max(0, Math.min(100, score)),
-    reason: candidate
-      ? "15m_trend_and_pullback_ready"
-      : direction === "none"
-      ? "15m_trend_not_aligned"
-      : !pullbackReady
-      ? "15m_pullback_not_near_ema20"
-      : "15m_volatility_filter_failed",
-    atrPips,
+    setupScore,
+    reason: `${state}:${strategyReason}`,
+    strategyState: state,
+    strategyReason,
   };
 }
 
@@ -558,6 +515,107 @@ async function sha256Hex(input: string): Promise<string> {
   return [...new Uint8Array(digest)].map((v) => v.toString(16).padStart(2, "0")).join("");
 }
 
+async function runOpportunityCheckWithTelegram(params: {
+  supabase: ReturnType<typeof createSupabaseAdminClient>;
+  symbol: string;
+  latestPrice: string | number;
+  latestCandleTimeUtc: string;
+  traceId: string;
+  telegramEnabled: boolean;
+  telegramBotToken: string;
+  telegramChatId: string;
+  telegramMaxMessagesPerHour: number;
+}): Promise<{ checkResult: TradingOpportunityResult; payload: Record<string, unknown> }> {
+  const checkResult = await runTradingOpportunityCheck({
+    supabase: params.supabase,
+    symbol: params.symbol,
+    latestPrice: params.latestPrice,
+    latestCandleTimeUtc: params.latestCandleTimeUtc,
+    traceId: params.traceId,
+  });
+
+  let telegram: Record<string, unknown>;
+  if (checkResult.should_notify && checkResult.signal_id !== null) {
+    if (params.telegramEnabled && params.telegramBotToken && params.telegramChatId) {
+      const text = buildTelegramTradingMessage(checkResult);
+      const messageHash = await sha256Hex(text);
+
+      const reservation = await reserveTelegramNotification({
+        supabase: params.supabase,
+        signalId: checkResult.signal_id,
+        symbol: params.symbol,
+        messageHash,
+        traceId: checkResult.trace_id,
+        maxMessagesPerHour: params.telegramMaxMessagesPerHour,
+      });
+
+      if (reservation.allowed) {
+        const sent = await sendTelegramMessage({
+          botToken: params.telegramBotToken,
+          chatId: params.telegramChatId,
+          text,
+        }).catch((err) => ({
+          ok: false,
+          status: 500,
+          messageId: null,
+          error: err instanceof Error ? err.message : String(err),
+        }));
+
+        await finalizeTelegramNotification({
+          supabase: params.supabase,
+          symbol: params.symbol,
+          messageHash,
+          sent: sent.ok,
+          errorText: sent.error,
+        });
+
+        if (sent.ok) {
+          await markOpportunityTelegramNotified({
+            supabase: params.supabase,
+            checkId: checkResult.check_id,
+            messageId: sent.messageId,
+          });
+        }
+
+        telegram = {
+          reserved: true,
+          sent: sent.ok,
+          status: sent.status,
+          message_id: sent.messageId,
+          error: sent.error,
+        };
+      } else {
+        telegram = {
+          reserved: false,
+          sent: false,
+          reason: reservation.reason,
+        };
+      }
+    } else {
+      telegram = {
+        sent: false,
+        reason: "telegram_not_configured",
+      };
+    }
+  } else {
+    telegram = {
+      sent: false,
+      reason: "notify_not_required",
+      signal_state: checkResult.signal_state,
+    };
+  }
+
+  return {
+    checkResult,
+    payload: {
+      invoked: true,
+      ok: true,
+      result: checkResult,
+      telegram,
+    },
+  };
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -637,16 +695,18 @@ serve(async (req) => {
     const watchBurstMinutes = parseInteger(Deno.env.get("SYNC_WATCH_BURST_MINUTES"), 20);
     const maxWatchSymbols = parseInteger(Deno.env.get("SYNC_WATCH_MAX_SYMBOLS"), 1);
     const watchBudgetReserve = parseInteger(Deno.env.get("SYNC_WATCH_MIN_DAY_REMAINING"), 30);
+    const watchSetupScoreMin = parseInteger(Deno.env.get("SYNC_WATCH_SETUP_SCORE_MIN"), 60);
     const catchupEnabled = parseBoolean(Deno.env.get("SYNC_BASELINE_CATCHUP_ENABLED"), true);
     const catchupMaxBarsPerSymbol = parseInteger(Deno.env.get("SYNC_BASELINE_CATCHUP_MAX_BARS_PER_SYMBOL"), 16);
     const catchupMaxCallsPerRun = parseInteger(Deno.env.get("SYNC_BASELINE_CATCHUP_MAX_CALLS_PER_RUN"), 12);
     const catchupBudgetReserve = parseInteger(Deno.env.get("SYNC_BASELINE_CATCHUP_MIN_DAY_REMAINING"), 40);
+    const catchupHardMinDayRemaining = parseInteger(Deno.env.get("SYNC_BASELINE_CATCHUP_HARD_MIN_DAY_REMAINING"), 5);
+    const catchupTrickleCallsPerRun = parseInteger(Deno.env.get("SYNC_BASELINE_CATCHUP_TRICKLE_CALLS_PER_RUN"), 1);
 
     const { primary: primaryProvider, fallback: fallbackProvider } = resolveProviders();
     const primaryLimits = providerLimits(primaryProvider);
 
     const lockEnabled = parseBoolean(Deno.env.get("LOCK_ENABLED"), true);
-    const lockFailOpen = parseBoolean(Deno.env.get("LOCK_FAIL_OPEN"), true);
     if (lockEnabled) {
       lockName = `sync-latest-candle:${targetMinuteIso}`;
       const syncLockTtlSeconds = parseInteger(Deno.env.get("SYNC_LOCK_TTL_SECONDS"), 1800);
@@ -660,7 +720,7 @@ serve(async (req) => {
       const lockRow = lockData as Record<string, unknown> | null;
 
       if (lockError) {
-        const canFailOpen = lockFailOpen || isMissingLockRpcError(lockError.message);
+        const canFailOpen = isMissingLockRpcError(lockError.message);
         if (canFailOpen) {
           lockName = null;
           await insertOpsAlert({
@@ -672,7 +732,7 @@ serve(async (req) => {
             payload: {
               rpc_error: lockError.message,
               target_complete_minute_utc: targetMinuteIso,
-              lock_fail_open: lockFailOpen,
+              lock_fail_open: false,
             },
           });
         } else {
@@ -680,7 +740,12 @@ serve(async (req) => {
         }
       }
 
-      const lockAcquired = lockError ? true : Boolean(lockRow?.acquired);
+      const lockOwnerTraceId = lockRow?.owner_trace_id === null || lockRow?.owner_trace_id === undefined
+        ? null
+        : String(lockRow.owner_trace_id);
+      const lockAcquired = lockError
+        ? true
+        : Boolean(lockRow?.acquired) || lockOwnerTraceId === traceId;
       if (!lockAcquired) {
         runStatus = "partial";
         runPayload = {
@@ -758,9 +823,13 @@ serve(async (req) => {
     let watchCallsUsed = 0;
     let catchupCallsUsed = 0;
 
-    const baselineDue = forceBaseline15m || sessionActive;
+    const baselineDue = true;
+    const rotationOffset = symbols.length > 0
+      ? Math.floor(targetMinuteStart.getTime() / MINUTE_MS) % symbols.length
+      : 0;
+    const symbolsForRun = symbols.slice(rotationOffset).concat(symbols.slice(0, rotationOffset));
 
-    for (const symbol of symbols) {
+    for (const symbol of symbolsForRun) {
       const symbolResult: Record<string, unknown> = {
         symbol,
         session_active: sessionActive,
@@ -787,14 +856,9 @@ serve(async (req) => {
         }
 
         const latestSaved15mTime = latest15m?.candle_time ? new Date(String(latest15m.candle_time)) : null;
-        const runtimeBaselineTime = runtime?.last_baseline_15m_candle_time
-          ? new Date(String(runtime.last_baseline_15m_candle_time))
-          : null;
 
         let fetch15mStart = target15mStart;
-        if (catchupEnabled && runtimeBaselineTime && runtimeBaselineTime.getTime() < target15mStart.getTime()) {
-          fetch15mStart = new Date(runtimeBaselineTime.getTime() + FIFTEEN_MIN_MS);
-        } else if (catchupEnabled && latestSaved15mTime && latestSaved15mTime.getTime() < target15mStart.getTime()) {
+        if (catchupEnabled && latestSaved15mTime && latestSaved15mTime.getTime() < target15mStart.getTime()) {
           fetch15mStart = new Date(latestSaved15mTime.getTime() + FIFTEEN_MIN_MS);
         }
 
@@ -814,11 +878,26 @@ serve(async (req) => {
               missing_bars_estimate: missingBars,
               bars_scheduled: barsToFetch,
             };
-          } else if (!forceBaseline15m && dayRemainingEstimate <= catchupBudgetReserve) {
+          } else if (!forceBaseline15m && dayRemainingEstimate <= catchupHardMinDayRemaining) {
+            symbolResult.baseline_15m = {
+              skipped: true,
+              reason: "catchup_day_limit_hard_guard",
+              day_remaining: dayRemainingEstimate,
+              hard_min_day_remaining: catchupHardMinDayRemaining,
+              missing_bars_estimate: missingBars,
+              bars_scheduled: barsToFetch,
+            };
+          } else if (
+            !forceBaseline15m &&
+            dayRemainingEstimate <= catchupBudgetReserve &&
+            catchupCallsUsed >= catchupTrickleCallsPerRun
+          ) {
             symbolResult.baseline_15m = {
               skipped: true,
               reason: "catchup_budget_guard",
               day_remaining: dayRemainingEstimate,
+              reserve_day_remaining: catchupBudgetReserve,
+              trickle_calls_per_run: catchupTrickleCallsPerRun,
               missing_bars_estimate: missingBars,
               bars_scheduled: barsToFetch,
             };
@@ -901,31 +980,62 @@ serve(async (req) => {
           throw new Error(`Failed loading 15m candles for setup stage: ${latest15mError.message}`);
         }
 
-        const rowsAsc = (latest15mRows ?? [])
-          .map((row) => ({
-            datetime: formatUtcDateTime(new Date(String(row.candle_time))),
-            open: String(row.open),
-            high: String(row.high),
-            low: String(row.low),
-            close: String(row.close),
-            volume: row.volume === null ? null : String(row.volume),
-          }))
-          .reverse();
+        const latestBaselineRow = (latest15mRows ?? [])[0];
+        const latestBaselineCheckpointIso = latestBaselineRow?.candle_time
+          ? new Date(String(latestBaselineRow.candle_time)).toISOString()
+          : target15mIso;
+        const latestBaselineClose = latestBaselineRow ? String(latestBaselineRow.close) : null;
 
-        const latestBaselineCheckpoint = rowsAsc.length > 0 ? rowsAsc[rowsAsc.length - 1].datetime : null;
+        let baselineCheckResult: TradingOpportunityResult | null = null;
+        if (runOpportunityCheck && latestBaselineClose !== null) {
+          const baselineCheck = await runOpportunityCheckWithTelegram({
+            supabase,
+            symbol,
+            latestPrice: latestBaselineClose,
+            latestCandleTimeUtc: latestBaselineCheckpointIso,
+            traceId: `${traceId}-${symbol.replace("/", "")}-baseline`,
+            telegramEnabled,
+            telegramBotToken,
+            telegramChatId,
+            telegramMaxMessagesPerHour,
+          });
+          baselineCheckResult = baselineCheck.checkResult;
+          symbolResult.opportunity_check = baselineCheck.payload;
+        } else if (runOpportunityCheck) {
+          symbolResult.opportunity_check = {
+            invoked: false,
+            ok: false,
+            reason: "latest_15m_candle_unavailable",
+          };
+        } else {
+          symbolResult.opportunity_check = {
+            invoked: false,
+            ok: false,
+            reason: "run_opportunity_check_disabled",
+          };
+        }
 
-        const setup = evaluate15mSetup(symbol, rowsAsc);
+        const setup = evaluateBaselineSetupFromCheck(baselineCheckResult);
         symbolResult.baseline_setup = {
           candidate: setup.candidate,
           direction: setup.direction,
           setup_score: setup.setupScore,
           reason: setup.reason,
-          atr_pips: setup.atrPips,
+          strategy_state: setup.strategyState,
+          strategy_reason: setup.strategyReason,
         };
 
-        const canActivateWatch = setup.candidate &&
+        const scoreEligible = setup.setupScore >= watchSetupScoreMin;
+        const signalAlreadyTriggered = baselineCheckResult !== null &&
+          (baselineCheckResult.signal_state === "triggered" || baselineCheckResult.signal_state === "executed");
+        const canActivateWatch = forceWatch1m || (
+          sessionActive &&
+          setup.candidate &&
+          scoreEligible &&
+          !signalAlreadyTriggered &&
           dayRemainingEstimate > watchBudgetReserve &&
-          (watchActive || activeWatchCount < maxWatchSymbols || forceWatch1m);
+          (watchActive || activeWatchCount < maxWatchSymbols)
+        );
 
         if (canActivateWatch) {
           const watchUntil = new Date(nowUtc.getTime() + watchBurstMinutes * MINUTE_MS).toISOString();
@@ -939,7 +1049,7 @@ serve(async (req) => {
               watch_reason: setup.reason,
               watch_direction: setup.direction,
               watch_setup_score: setup.setupScore,
-              last_baseline_15m_candle_time: latestBaselineCheckpoint ?? target15mIso,
+              last_baseline_15m_candle_time: latestBaselineCheckpointIso,
               last_provider: primaryProvider,
               updated_at: nowUtc.toISOString(),
             }, { onConflict: "symbol" });
@@ -954,14 +1064,14 @@ serve(async (req) => {
             activated: !runtime?.watch_mode_active,
           };
         } else {
-          if (watchActive && watchUntilMs <= nowUtc.getTime()) {
+          if (watchActive && (watchUntilMs <= nowUtc.getTime() || signalAlreadyTriggered)) {
             await supabase
               .from("sync_symbol_runtime_state")
               .upsert({
                 symbol,
                 watch_mode_active: false,
                 watch_until: null,
-                watch_reason: "watch_ttl_expired",
+                watch_reason: signalAlreadyTriggered ? "signal_already_triggered" : "watch_ttl_expired",
                 watch_setup_score: null,
                 watch_direction: null,
                 updated_at: nowUtc.toISOString(),
@@ -974,11 +1084,18 @@ serve(async (req) => {
           symbolResult.watch_mode = {
             active: watchActive,
             reason: setup.reason,
-            skipped_activation: !setup.candidate
-              ? "setup_not_ready"
+            skipped_activation: signalAlreadyTriggered
+              ? "signal_already_triggered"
+              : !sessionActive
+              ? "outside_session_window"
+              : !setup.candidate
+              ? "structure_not_ready"
+              : !scoreEligible
+              ? "setup_score_below_threshold"
               : dayRemainingEstimate <= watchBudgetReserve
               ? "budget_reserve_guard"
               : "watch_capacity_reached",
+            watch_setup_score_min: watchSetupScoreMin,
           };
 
           await supabase
@@ -990,19 +1107,39 @@ serve(async (req) => {
               watch_reason: watchActive ? runtime?.watch_reason ?? setup.reason : setup.reason,
               watch_direction: watchActive ? runtime?.watch_direction ?? setup.direction : setup.direction,
               watch_setup_score: watchActive ? runtime?.watch_setup_score ?? setup.setupScore : setup.setupScore,
-              last_baseline_15m_candle_time: latestBaselineCheckpoint ?? target15mIso,
+              last_baseline_15m_candle_time: latestBaselineCheckpointIso,
               last_provider: primaryProvider,
               updated_at: nowUtc.toISOString(),
             }, { onConflict: "symbol" });
         }
-      } else {
-        symbolResult.baseline_15m = {
-          skipped: true,
-          reason: "outside_session_window",
-        };
       }
 
       // 1m burst stage
+      if (!sessionActive && !forceWatch1m) {
+        if (watchActive) {
+          await supabase
+            .from("sync_symbol_runtime_state")
+            .upsert({
+              symbol,
+              watch_mode_active: false,
+              watch_until: null,
+              watch_reason: "outside_session_window",
+              watch_setup_score: null,
+              watch_direction: null,
+              updated_at: nowUtc.toISOString(),
+            }, { onConflict: "symbol" });
+          watchActive = false;
+          watchUntilIso = null;
+          activeWatchCount = Math.max(0, activeWatchCount - 1);
+        }
+        symbolResult.minute_1m = {
+          skipped: true,
+          reason: "outside_session_window",
+        };
+        results.push(symbolResult);
+        continue;
+      }
+
       if (!(watchActive || forceWatch1m)) {
         symbolResult.minute_1m = {
           skipped: true,
@@ -1101,95 +1238,22 @@ serve(async (req) => {
           updated_at: nowUtc.toISOString(),
         }, { onConflict: "symbol" });
 
-      let opportunityCheck: Record<string, unknown> | null = null;
+      let opportunityCheck = symbolResult.opportunity_check as Record<string, unknown> | null;
       if (runOpportunityCheck) {
-        const checkResult = await runTradingOpportunityCheck({
+        const minuteCheck = await runOpportunityCheckWithTelegram({
           supabase,
           symbol,
           latestPrice: fetchedMinute.candle.close,
           latestCandleTimeUtc: fetchedMinute.candle.datetime,
           traceId: `${traceId}-${symbol.replace("/", "")}`,
+          telegramEnabled,
+          telegramBotToken,
+          telegramChatId,
+          telegramMaxMessagesPerHour,
         });
+        opportunityCheck = minuteCheck.payload;
 
-        let telegram: Record<string, unknown> | null = null;
-        if (checkResult.should_notify && checkResult.signal_id !== null) {
-          if (telegramEnabled && telegramBotToken && telegramChatId) {
-            const text = buildTelegramTradingMessage(checkResult);
-            const messageHash = await sha256Hex(text);
-
-            const reservation = await reserveTelegramNotification({
-              supabase,
-              signalId: checkResult.signal_id,
-              symbol,
-              messageHash,
-              traceId: checkResult.trace_id,
-              maxMessagesPerHour: telegramMaxMessagesPerHour,
-            });
-
-            if (reservation.allowed) {
-              const sent = await sendTelegramMessage({
-                botToken: telegramBotToken,
-                chatId: telegramChatId,
-                text,
-              }).catch((err) => ({
-                ok: false,
-                status: 500,
-                messageId: null,
-                error: err instanceof Error ? err.message : String(err),
-              }));
-
-              await finalizeTelegramNotification({
-                supabase,
-                symbol,
-                messageHash,
-                sent: sent.ok,
-                errorText: sent.error,
-              });
-
-              if (sent.ok) {
-                await markOpportunityTelegramNotified({
-                  supabase,
-                  checkId: checkResult.check_id,
-                  messageId: sent.messageId,
-                });
-              }
-
-              telegram = {
-                reserved: true,
-                sent: sent.ok,
-                status: sent.status,
-                message_id: sent.messageId,
-                error: sent.error,
-              };
-            } else {
-              telegram = {
-                reserved: false,
-                sent: false,
-                reason: reservation.reason,
-              };
-            }
-          } else {
-            telegram = {
-              sent: false,
-              reason: "telegram_not_configured",
-            };
-          }
-        } else {
-          telegram = {
-            sent: false,
-            reason: "notify_not_required",
-            signal_state: checkResult.signal_state,
-          };
-        }
-
-        opportunityCheck = {
-          invoked: true,
-          ok: true,
-          result: checkResult,
-          telegram,
-        };
-
-        if (checkResult.signal_state === "triggered" || checkResult.signal_state === "executed") {
+        if (minuteCheck.checkResult.signal_state === "triggered" || minuteCheck.checkResult.signal_state === "executed") {
           await supabase
             .from("sync_symbol_runtime_state")
             .upsert({
@@ -1245,12 +1309,22 @@ serve(async (req) => {
       }
     }
 
+    const resultsBySymbol = new Map<string, Record<string, unknown>>();
+    for (const row of results) {
+      const symbol = String(row.symbol ?? "");
+      if (!symbol) continue;
+      resultsBySymbol.set(symbol, row);
+    }
+    const orderedResults = symbols.map((symbol) => {
+      return resultsBySymbol.get(symbol) ?? { symbol, error: "symbol_not_processed" };
+    });
+
     const responsePayload = {
       trace_id: traceId,
       symbols_requested: symbols,
       target_complete_minute_utc: targetMinuteIso,
       target_complete_15m_utc: target15mIso,
-      symbols_processed: results.length,
+      symbols_processed: orderedResults.length,
       api_calls_used: apiCallsUsed,
       baseline_15m_calls_used: baselineCallsUsed,
       baseline_15m_catchup_calls_used: catchupCallsUsed,
@@ -1266,12 +1340,15 @@ serve(async (req) => {
         watch_burst_minutes: watchBurstMinutes,
         watch_max_symbols: maxWatchSymbols,
         watch_budget_reserve_calls: watchBudgetReserve,
+        watch_setup_score_min: watchSetupScoreMin,
         baseline_catchup_enabled: catchupEnabled,
         baseline_catchup_max_bars_per_symbol: catchupMaxBarsPerSymbol,
         baseline_catchup_max_calls_per_run: catchupMaxCallsPerRun,
         baseline_catchup_budget_reserve_calls: catchupBudgetReserve,
+        baseline_catchup_hard_min_day_remaining: catchupHardMinDayRemaining,
+        baseline_catchup_trickle_calls_per_run: catchupTrickleCallsPerRun,
       },
-      results,
+      results: orderedResults,
     };
 
     runStatus = "success";
